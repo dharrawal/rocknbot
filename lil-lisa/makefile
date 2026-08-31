@@ -10,10 +10,7 @@ TAG=2.3.2
 
 .EXPORT_ALL_VARIABLES:
 
-.PHONY: _include-env
-
-_include-env:
-    include ./app_envfiles/${IMAGE}.env
+-include ./app_envfiles/${IMAGE}.env
 
 _wait30s:
 	@echo "lets wait 30 sec..."
