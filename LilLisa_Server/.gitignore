@@ -5,7 +5,12 @@
 .mypy_cache/
 
 # Ignore app environment files
-env/
+env/*
+!env/*.example
+
+# Ignore tool-specific credential env files
+scripts/env/*
+!scripts/env/*.example
 
 # Ignore nightly techsupport sync local state
 scripts/techsupport_sync_state.json
@@ -18,6 +23,11 @@ scripts/techsupport_review_state.json
 
 # Ignore techsupport escalation-thread related-entry tags local state
 scripts/techsupport_thread_tags.json
+
+# Ignore one-time historical import/revert local run-state files
+scripts/historical_import_state.json
+scripts/historical_import_production_state.json
+scripts/historical_revert_state.json
 
 # Ignore Docker ignore files
 .dockerignore
