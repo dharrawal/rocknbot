@@ -7,9 +7,21 @@ reply activity since the last run.
 
 Slack's conversations.history only returns new top-level messages (filtered by
 an "oldest" timestamp) -- it does NOT surface new replies posted to existing
-threads. To catch updated threads we keep a local record of every thread we've
-seen and its last-known-latest-reply timestamp, and on each run call
-conversations.replies for each tracked thread to see if that timestamp moved.
+threads. Slack has no "threads updated since T" API; parent messages do carry
+latest_reply when you fetch the parent itself.
+
+Detection therefore:
+  1. Finds new parents via conversations.history(oldest=last_run) and stores
+     each message's latest_reply (no extra call).
+  2. Refreshes latest_reply on a bounded set of already-known threads by
+     fetching the parent only (conversations.history, inclusive, limit=1) --
+     never conversations.replies. Nightly: threads whose last_seen_reply_ts
+     is within TECHSUPPORT_SYNC_HOT_DAYS (default 30). Periodic catch-up:
+     threads within TECHSUPPORT_SYNC_CATCHUP_AGE_DAYS (default 90). Both
+     lists are capped at TECHSUPPORT_SYNC_MAX_PARENT_LOOKUPS. Threads quieter
+     than the catch-up age cap are not polled (state is kept, including
+     added_to_verified_db). The pipeline fetches full replies later, and only
+     for new/updated ids.
 
 This is step one of the nightly techsupport sync job: it only detects new /
 updated threads. Classifying threads as resolved (or anything else) is a
@@ -20,6 +32,12 @@ Required env vars (see ./env/techsupport_sync.env):
                               (and the read scope for the channel type in use)
     TECHSUPPORT_CHANNEL_ID - Channel ID to sync (e.g. the test-techsupport channel)
 
+Optional knobs (env/lillisa_server.env, overridable in the process environment):
+    TECHSUPPORT_SYNC_HOT_DAYS                - nightly parent-lookup window (default 30)
+    TECHSUPPORT_SYNC_CATCHUP_AGE_DAYS        - catch-up age cap (default 90)
+    TECHSUPPORT_SYNC_CATCHUP_INTERVAL_DAYS   - how often catch-up runs (default 7)
+    TECHSUPPORT_SYNC_MAX_PARENT_LOOKUPS      - cap per lookup set (default 200)
+
 Usage:
     python nightly_techsupport_sync.py
 """
@@ -27,19 +45,32 @@ Usage:
 import json
 import logging
 import os
+import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import requests
 from dotenv import dotenv_values
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from atomic_io import atomic_write_json  # noqa: E402
+
 ENV_PATH = SCRIPT_DIR / "env" / "techsupport_sync.env"
+LILLISA_SERVER_ENV_PATH = PROJECT_ROOT / "env" / "lillisa_server.env"
 STATE_PATH = SCRIPT_DIR / "techsupport_sync_state.json"
 
 SLACK_API_BASE = "https://slack.com/api"
 IGNORED_SUBTYPES = {"channel_join", "channel_leave"}
+SECONDS_PER_DAY = 86400.0
+
+DEFAULT_HOT_DAYS = 30.0
+DEFAULT_CATCHUP_AGE_DAYS = 90.0
+DEFAULT_CATCHUP_INTERVAL_DAYS = 7.0
+DEFAULT_MAX_PARENT_LOOKUPS = 200
 
 # Same propagation-delay quirk fixed the same way in
 # lil-lisa/src/slack.py's conversations_replies_with_retry(): a channel/
@@ -49,13 +80,9 @@ IGNORED_SUBTYPES = {"channel_join", "channel_leave"}
 CHANNEL_NOT_FOUND_RETRY_DELAY_SECONDS = 3.0
 CHANNEL_NOT_FOUND_MAX_RETRIES = 2
 
-# sync()'s per-thread conversations.replies loop below fires one call per
-# tracked thread back-to-back on the same token with no throttling, unlike
-# paginate_messages()'s own inter-page sleep(1). With dozens of tracked
-# threads that's a burst of same-token requests in a few seconds -- observed
-# to trigger transient channel_not_found (retries exhausted, all 3 attempts
-# failing) that isolated single-request tests against the same channel/token
-# never hit. This throttles that loop the same way pagination already is.
+# Parent-lookup loop fires one conversations.history call per selected
+# thread. Throttle the same way pagination already is, so a burst of
+# same-token requests does not trip transient channel_not_found.
 PER_THREAD_THROTTLE_SECONDS = 0.3
 
 # No basicConfig() call -- library module, imported into nightly_pipeline.py
@@ -83,6 +110,32 @@ def load_env() -> Dict[str, str]:
     return env
 
 
+def _pipeline_env() -> Dict[str, str]:
+    env: Dict[str, str] = {}
+    if LILLISA_SERVER_ENV_PATH.exists():
+        env.update({k: v for k, v in dotenv_values(str(LILLISA_SERVER_ENV_PATH)).items() if v is not None})
+    env.update({k: v for k, v in os.environ.items() if v is not None})
+    return env
+
+
+def get_hot_days() -> float:
+    return float(_pipeline_env().get("TECHSUPPORT_SYNC_HOT_DAYS", str(DEFAULT_HOT_DAYS)))
+
+
+def get_catchup_age_days() -> float:
+    return float(_pipeline_env().get("TECHSUPPORT_SYNC_CATCHUP_AGE_DAYS", str(DEFAULT_CATCHUP_AGE_DAYS)))
+
+
+def get_catchup_interval_days() -> float:
+    return float(
+        _pipeline_env().get("TECHSUPPORT_SYNC_CATCHUP_INTERVAL_DAYS", str(DEFAULT_CATCHUP_INTERVAL_DAYS))
+    )
+
+
+def get_max_parent_lookups() -> int:
+    return int(float(_pipeline_env().get("TECHSUPPORT_SYNC_MAX_PARENT_LOOKUPS", str(DEFAULT_MAX_PARENT_LOOKUPS))))
+
+
 def load_state() -> Dict[str, Any]:
     if not STATE_PATH.exists():
         return {"last_run_timestamp": "0", "threads": {}}
@@ -91,8 +144,7 @@ def load_state() -> Dict[str, Any]:
 
 
 def save_state(state: Dict[str, Any]) -> None:
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, sort_keys=True)
+    atomic_write_json(STATE_PATH, state, indent=2, sort_keys=True)
 
 
 def slack_api_call(method: str, token: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -168,16 +220,96 @@ def find_new_threads(
     return new_threads
 
 
-def latest_reply_ts(token: str, channel_id: str, thread_ts: str) -> str:
-    """Latest message ts in a thread (the parent itself if it has no replies)."""
-    replies = paginate_messages(
-        "conversations.replies",
+def parent_activity_ts(thread_ts: str, info: Optional[Dict[str, Any]] = None) -> float:
+    """Unix time of last known activity: stored last_seen_reply_ts, else parent ts."""
+    info = info or {}
+    raw = info.get("last_seen_reply_ts") or thread_ts
+    return float(raw)
+
+
+def select_parent_lookups(
+    thread_ids: Sequence[str],
+    threads: Dict[str, Any],
+    now: float,
+    window_days: float,
+    max_lookups: int,
+    exclude: Optional[Iterable[str]] = None,
+) -> Tuple[List[str], int]:
+    """Pick known threads to refresh via a cheap parent latest_reply fetch.
+
+    Includes threads whose last_seen_reply_ts is within window_days of now,
+    hottest first (most recent activity first). Caps at max_lookups. Does not
+    delete or mutate state for threads that age out or exceed the cap.
+
+    Returns (ids_to_check, skipped_over_cap).
+    """
+    excluded: Set[str] = set(exclude or [])
+    window_seconds = window_days * SECONDS_PER_DAY
+    eligible: List[Tuple[float, str]] = []
+    for thread_ts in thread_ids:
+        if thread_ts in excluded:
+            continue
+        activity = parent_activity_ts(thread_ts, threads.get(thread_ts) or {})
+        if now - activity <= window_seconds:
+            eligible.append((activity, thread_ts))
+    eligible.sort(key=lambda item: item[0], reverse=True)
+    chosen = [thread_ts for _, thread_ts in eligible[:max_lookups]]
+    skipped_over_cap = max(0, len(eligible) - len(chosen))
+    return chosen, skipped_over_cap
+
+
+def is_catchup_due(state: Dict[str, Any], now: float, interval_days: float) -> bool:
+    last = state.get("last_catchup_timestamp")
+    if last is None or last == "":
+        return True
+    return (now - float(last)) >= interval_days * SECONDS_PER_DAY
+
+
+def fetch_parent_latest_reply_ts(token: str, channel_id: str, thread_ts: str) -> str:
+    """Return Slack's latest_reply on the parent message, or the parent ts.
+
+    Uses conversations.history inclusive limit=1 (Slack's documented single-
+    message lookup) so sync() never downloads the reply list. The pipeline
+    fetches conversations.replies later for threads that actually changed.
+    """
+    data = slack_api_call(
+        "conversations.history",
         token,
-        {"channel": channel_id, "ts": thread_ts, "limit": 200},
+        {
+            "channel": channel_id,
+            "oldest": thread_ts,
+            "inclusive": "true",
+            "limit": 1,
+        },
     )
-    if not replies:
-        return thread_ts
-    return replies[-1]["ts"]
+    messages = data.get("messages") or []
+    if not messages:
+        raise RuntimeError(f"No parent message found for thread {thread_ts}")
+    parent = messages[0]
+    return parent.get("latest_reply") or parent.get("ts") or thread_ts
+
+
+def _refresh_known_threads(
+    token: str,
+    channel_id: str,
+    threads: Dict[str, Any],
+    thread_ids: Sequence[str],
+) -> List[str]:
+    """Compare stored last_seen_reply_ts to Slack latest_reply; return updated ids."""
+    updated_thread_ids: List[str] = []
+    for index, thread_ts in enumerate(thread_ids):
+        try:
+            newest_ts = fetch_parent_latest_reply_ts(token, channel_id, thread_ts)
+        except Exception as exc:  # noqa: BLE001 -- one missing parent must not abort the run
+            logger.warning("Skipping parent lookup for thread %s: %s", thread_ts, exc)
+            continue
+        previous = threads.setdefault(thread_ts, {}).get("last_seen_reply_ts", thread_ts)
+        if float(newest_ts) > float(previous):
+            updated_thread_ids.append(thread_ts)
+        threads[thread_ts]["last_seen_reply_ts"] = newest_ts
+        if index < len(thread_ids) - 1:
+            time.sleep(PER_THREAD_THROTTLE_SECONDS)
+    return updated_thread_ids
 
 
 def sync() -> Dict[str, List[str]]:
@@ -193,6 +325,7 @@ def sync() -> Dict[str, List[str]]:
     state = load_state()
     threads = state.setdefault("threads", {})
     last_run_timestamp = state.get("last_run_timestamp", "0")
+    now = time.time()
 
     # Snapshot of threads we already knew about *before* this run, so we can
     # tell "brand new" apart from "existing, checked for new replies".
@@ -205,21 +338,66 @@ def sync() -> Dict[str, List[str]]:
         thread_ts = msg["ts"]
         # conversations.history already tells us the latest reply ts for
         # threads with replies, so no extra API call is needed here.
-        threads[thread_ts] = {"last_seen_reply_ts": msg.get("latest_reply", thread_ts)}
+        existing = threads.get(thread_ts) or {}
+        threads[thread_ts] = {**existing, "last_seen_reply_ts": msg.get("latest_reply", thread_ts)}
 
-    updated_thread_ids = []
-    for thread_ts in previously_known_thread_ids:
-        newest_ts = latest_reply_ts(token, channel_id, thread_ts)
-        if float(newest_ts) > float(threads[thread_ts]["last_seen_reply_ts"]):
-            updated_thread_ids.append(thread_ts)
-        threads[thread_ts]["last_seen_reply_ts"] = newest_ts
-        time.sleep(PER_THREAD_THROTTLE_SECONDS)
+    hot_days = get_hot_days()
+    catchup_age_days = get_catchup_age_days()
+    catchup_interval_days = get_catchup_interval_days()
+    max_lookups = get_max_parent_lookups()
 
-    state["last_run_timestamp"] = f"{time.time():.6f}"
+    hot_ids, hot_capped = select_parent_lookups(
+        previously_known_thread_ids, threads, now, hot_days, max_lookups
+    )
+    lookup_ids = list(hot_ids)
+    catchup_due = is_catchup_due(state, now, catchup_interval_days)
+    catchup_ids: List[str] = []
+    catchup_capped = 0
+    if catchup_due:
+        catchup_ids, catchup_capped = select_parent_lookups(
+            previously_known_thread_ids,
+            threads,
+            now,
+            catchup_age_days,
+            max_lookups,
+            exclude=hot_ids,
+        )
+        lookup_ids.extend(catchup_ids)
+
+    logger.info(
+        "Parent lookups: hot=%d (window=%.0fd, capped=%d) catchup_due=%s catchup=%d "
+        "(age_cap=%.0fd, capped=%d) skipped_older_than_catchup=%d",
+        len(hot_ids),
+        hot_days,
+        hot_capped,
+        catchup_due,
+        len(catchup_ids),
+        catchup_age_days,
+        catchup_capped,
+        _count_older_than(previously_known_thread_ids, threads, now, catchup_age_days),
+    )
+
+    updated_thread_ids = _refresh_known_threads(token, channel_id, threads, lookup_ids)
+
+    state["last_run_timestamp"] = f"{now:.6f}"
+    if catchup_due:
+        state["last_catchup_timestamp"] = f"{now:.6f}"
     save_state(state)
 
     new_thread_ids = [msg["ts"] for msg in new_threads]
     return {"new_thread_ids": new_thread_ids, "updated_thread_ids": updated_thread_ids}
+
+
+def _count_older_than(
+    thread_ids: Sequence[str], threads: Dict[str, Any], now: float, age_days: float
+) -> int:
+    window_seconds = age_days * SECONDS_PER_DAY
+    older = 0
+    for thread_ts in thread_ids:
+        activity = parent_activity_ts(thread_ts, threads.get(thread_ts) or {})
+        if now - activity > window_seconds:
+            older += 1
+    return older
 
 
 def main() -> None:

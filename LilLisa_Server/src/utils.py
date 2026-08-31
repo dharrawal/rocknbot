@@ -26,6 +26,74 @@ LILLISA_SERVER_ENV_DICT = {
 }
 
 
+NO_ANSWER_MARKER = "[[NO_ANSWER]]"
+
+
+def parse_leading_no_answer_marker(
+    llm_response: str, marker: str = NO_ANSWER_MARKER
+) -> tuple[bool, str]:
+    """Treat as no-answer only if `marker` starts the response (after leading whitespace).
+
+    The QA prompt requires the marker first, then the user-facing text. A later
+    occurrence (quoted instructions, a fenced example, echoed retrieved text)
+    is not a no-answer signal and must stay in the body.
+
+    Returns (answer_found, text_for_user). When no-answer, the leading marker
+    and following whitespace are stripped. Leading whitespace on a real answer
+    is left unchanged.
+    """
+    stripped = llm_response.lstrip()
+    if stripped.startswith(marker):
+        return False, stripped[len(marker) :].lstrip()
+    return True, llm_response
+
+
+# Same-prompt retry after a leading [[NO_ANSWER]] when the top rerank score is
+# above this value. The retry's answer is served; build_no_answer_retry_log_record
+# captures each occurrence so pr42-enhancements.2 can check whether try-2 is
+# actually grounded in that high-scoring chunk.
+NO_ANSWER_RETRY_SCORE_THRESHOLD = 3.0
+
+
+def build_no_answer_retry_log_record(
+    *,
+    product: str,
+    original_query: str,
+    generated_query: str,
+    top_rerank_score: float,
+    threshold: float,
+    top_chunk_text: str,
+    top_chunk_metadata: dict,
+    first_response: str,
+    retry_response: str,
+    first_answer_found: bool,
+    retry_answer_found: bool,
+) -> dict:
+    """Fields needed later to judge whether the served try-2 is grounded in the top chunk.
+
+    Extract `event=NO_ANSWER_RETRY` lines from server logs. `changed_outcome`
+    is true when try-1 was no-answer and try-2 is not -- those are the cases
+    where the retry turned an "I don't know" into an answer the user received.
+    The queries, both raw completions, top score, and top chunk (text + source
+    metadata) are enough to score try-2 relevance without a second retrieval.
+    """
+    return {
+        "event": "NO_ANSWER_RETRY",
+        "product": product,
+        "original_query": original_query,
+        "generated_query": generated_query,
+        "top_rerank_score": top_rerank_score,
+        "threshold": threshold,
+        "top_chunk_text": top_chunk_text,
+        "top_chunk_metadata": top_chunk_metadata,
+        "first_response": first_response,
+        "retry_response": retry_response,
+        "first_answer_found": first_answer_found,
+        "retry_answer_found": retry_answer_found,
+        "changed_outcome": (not first_answer_found) and retry_answer_found,
+    }
+
+
 def get_env_variable(var_name: str, default: Optional[str] = None) -> str:
     """
     Helper function to get the environment variable or raise exception.

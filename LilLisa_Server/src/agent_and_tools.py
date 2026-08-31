@@ -710,8 +710,10 @@ def answer_from_document_retrieval(
     ).choices[0].message.content
     utils.logger.debug("PERF | answer_generation_llm | %.3fs", time.perf_counter() - t0_llm)
 
-    no_answer_marker = "[[NO_ANSWER]]"
     utils.logger.debug("DEBUG_NO_ANSWER | raw llm_response before stripping: %r", llm_response)
+
+    first_raw_response = llm_response or ""
+    answer_found, llm_response = utils.parse_leading_no_answer_marker(first_raw_response)
 
     # Mistral's hosted inference layer has been observed to non-deterministically emit
     # [[NO_ANSWER]] on identical input even at temperature=0 (confirmed: the same prompt
@@ -721,36 +723,56 @@ def answer_from_document_retrieval(
     # once before giving up. Threshold is well below the 6.0069 top-score seen in a
     # confirmed-good case, with margin, since cross-encoder scores for genuinely
     # off-topic top matches were observed well under 1.
-    NO_ANSWER_RETRY_SCORE_THRESHOLD = 3.0
+    #
+    # High rerank score means the top chunk looks similar, not that the answer is in
+    # context, so whether serving try-2 is right is still an open question --
+    # pr42-enhancements.2 answers it from the NO_ANSWER_RETRY log records below.
+    top_score = reranked_nodes[0].score if reranked_nodes else None
     if (
-        llm_response.find(no_answer_marker) != -1
-        and reranked_nodes
-        and reranked_nodes[0].score > NO_ANSWER_RETRY_SCORE_THRESHOLD
+        not answer_found
+        and top_score is not None
+        and top_score > utils.NO_ANSWER_RETRY_SCORE_THRESHOLD
     ):
-        utils.logger.info(
-            "NO_ANSWER_RETRY | retrying | top_reranked_score=%.4f (threshold=%.1f)",
-            reranked_nodes[0].score, NO_ANSWER_RETRY_SCORE_THRESHOLD,
-        )
         t0_retry = time.perf_counter()
-        retry_response = completion(
-            model=LLM_MODEL,
-            messages=llm_messages,
-            temperature=0.0,
-        ).choices[0].message.content
-        utils.logger.debug("PERF | answer_generation_llm_retry | %.3fs", time.perf_counter() - t0_retry)
-        retry_changed_outcome = retry_response.find(no_answer_marker) == -1
-        utils.logger.info(
-            "NO_ANSWER_RETRY | retry complete | changed_outcome=%s | retry_response: %r",
-            retry_changed_outcome, retry_response,
+        retry_raw_response = (
+            completion(
+                model=LLM_MODEL,
+                messages=llm_messages,
+                temperature=0.0,
+            ).choices[0].message.content
+            or ""
         )
-        llm_response = retry_response
+        utils.logger.debug("PERF | answer_generation_llm_retry | %.3fs", time.perf_counter() - t0_retry)
+        retry_answer_found, retry_text = utils.parse_leading_no_answer_marker(retry_raw_response)
+        top_node = reranked_nodes[0]
+        top_meta = dict(top_node.metadata or {})
+        if "answer" in top_meta:
+            top_chunk_text = (
+                f"Question: {top_node.text}\nAnswer: {top_meta.get('answer')}"
+            )
+        else:
+            top_chunk_text = top_node.text or ""
+        log_record = utils.build_no_answer_retry_log_record(
+            product=product,
+            original_query=original_query,
+            generated_query=generated_query,
+            top_rerank_score=float(top_score),
+            threshold=utils.NO_ANSWER_RETRY_SCORE_THRESHOLD,
+            top_chunk_text=top_chunk_text,
+            top_chunk_metadata={
+                k: (v if v is None or isinstance(v, (str, int, float, bool)) else str(v))
+                for k, v in top_meta.items()
+            },
+            first_response=first_raw_response,
+            retry_response=retry_raw_response,
+            first_answer_found=answer_found,
+            retry_answer_found=retry_answer_found,
+        )
+        utils.logger.info("NO_ANSWER_RETRY | %s", json.dumps(log_record, ensure_ascii=False))
 
-    marker_index = llm_response.find(no_answer_marker)
-    if marker_index != -1:
-        answer_found = False
-        llm_response = llm_response[marker_index + len(no_answer_marker):].lstrip()
-    else:
-        answer_found = True
+        # The retry replaces try-1, including when it is also a no-answer.
+        answer_found, llm_response = retry_answer_found, retry_text
+
     utils.logger.debug(
         "DEBUG_NO_ANSWER | marker_stripped=%s answer_found=%s final llm_response: %r",
         not answer_found,

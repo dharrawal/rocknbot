@@ -21,7 +21,7 @@ from slack_bolt.adapter.socket_mode.async_handler import (  # type: ignore
 from slack_bolt.async_app import AsyncApp  # type: ignore
 from slack_sdk.errors import SlackApiError  # type: ignore
 
-from utils import logger
+from utils import logger, parse_get_ans_result
 
 lil_lisa_env = dotenv_values("./app_envfiles/lil-lisa.env")
 
@@ -45,12 +45,15 @@ if not CHANNEL_ID_IDO:
     logger.warning("CHANNEL_ID_IDO not found in lil-lisa.env — IDO Slack channel support will be disabled")
 
 # Techsupport escalation channels (distinct from the ADMIN_CHANNEL_ID_* bot-management channels).
-# Optional — if unset for a product, the "Post question in tech support channel" button will be disabled for it.
+# Optional — if unset for a product, process_msg omits the escalate button for that product.
 TECHSUPPORT_CHANNEL_ID_IDDM = lil_lisa_env.get("TECHSUPPORT_CHANNEL_ID_IDDM")
 TECHSUPPORT_CHANNEL_ID_IDA = lil_lisa_env.get("TECHSUPPORT_CHANNEL_ID_IDA")
 TECHSUPPORT_CHANNEL_ID_IDO = lil_lisa_env.get("TECHSUPPORT_CHANNEL_ID_IDO")
 if not TECHSUPPORT_CHANNEL_ID_IDDM or not TECHSUPPORT_CHANNEL_ID_IDA:
-    logger.warning("TECHSUPPORT_CHANNEL_ID_IDDM/TECHSUPPORT_CHANNEL_ID_IDA not found in lil-lisa.env — escalate-to-techsupport button will be disabled for those products")
+    logger.warning(
+        "TECHSUPPORT_CHANNEL_ID_IDDM/TECHSUPPORT_CHANNEL_ID_IDA not found in lil-lisa.env — "
+        "escalate-to-techsupport button will be omitted for those products"
+    )
 EXPERT_USER_ID_IDA = lil_lisa_env["EXPERT_USER_ID_IDA"]
 EXPERT_USER_ID_IDDM = lil_lisa_env["EXPERT_USER_ID_IDDM"]
 AUTHENTICATION_KEY = lil_lisa_env["AUTHENTICATION_KEY"]
@@ -602,6 +605,7 @@ async def tag_techsupport_thread(thread_ts: str, related_entry_title: str) -> No
             params={
                 "thread_ts": thread_ts,
                 "related_entry_title": related_entry_title,
+                "encrypted_key": ENCRYPTED_AUTHENTICATION_KEY,
             },
             timeout=60,
         )
@@ -613,7 +617,10 @@ async def fetch_conversation_history(session_id) -> str:
     full_url = f"{BASE_URL}/get_conversation_history/"
     response = requests.get(
         full_url,
-        params={"session_id": str(session_id)},
+        params={
+            "session_id": str(session_id),
+            "encrypted_key": ENCRYPTED_AUTHENTICATION_KEY,
+        },
         timeout=30,
     )
     response.raise_for_status()
@@ -626,6 +633,7 @@ async def get_refined_escalation_query(conversation_history: str) -> str:
     response = requests.post(
         full_url,
         json={"conversation_history": conversation_history},
+        params={"encrypted_key": ENCRYPTED_AUTHENTICATION_KEY},
         timeout=60,
     )
     response.raise_for_status()
@@ -698,11 +706,11 @@ async def process_msg(event, say):
         text = text[7:].lstrip()
         is_expert_answering = True
 
-    # 1) Call your FastAPI server and get raw JSON
+    # 1) Call your FastAPI server and get raw JSON (or a plain error string on timeout).
     raw_result = await get_ans(text, thread_ts, message_ts, product, is_expert_answering)
 
-    # 2) Parsing it as JSON.
-    parsed = json.loads(raw_result)
+    # 2) Parsing it as JSON. Timeout/exception paths from get_ans are plain strings.
+    parsed = parse_get_ans_result(raw_result)
 
     # 3) Extract "response", "links_text", "reranked_nodes", and whether this needs escalation
     bot_text = parsed.get("response", "").strip()
@@ -745,9 +753,13 @@ async def process_msg(event, say):
         f"message_ts={message_ts!r} orig_thread_ts={orig_thread_ts!r} query={text[:ESCALATE_VALUE_QUERY_MAX_LENGTH]!r}"
     )
 
+    techsupport_ready = bool(get_techsupport_channel(product))
+
     if needs_escalation:
-        # Bot could not answer: prominent button+note.
-        blocks = [*base_blocks, *build_escalation_blocks(button_value, prominent=True)]
+        # Bot could not answer: prominent button+note when a TS channel is configured.
+        blocks = [*base_blocks]
+        if techsupport_ready:
+            blocks.extend(build_escalation_blocks(button_value, prominent=True))
         post = await _post_message_with_fallback(
             channel_id=channel_id, thread_ts=orig_thread_ts, text=truncated_bot_text, blocks=blocks
         )
@@ -759,8 +771,10 @@ async def process_msg(event, say):
             text=truncated_bot_text,
         )
     else:
-        # Normal successful AI answer: subtle button+note.
-        blocks = [*base_blocks, *build_escalation_blocks(button_value, prominent=False)]
+        # Normal successful AI answer: subtle button+note when a TS channel is configured.
+        blocks = [*base_blocks]
+        if techsupport_ready:
+            blocks.extend(build_escalation_blocks(button_value, prominent=False))
         post = await _post_message_with_fallback(
             channel_id=channel_id, thread_ts=orig_thread_ts, text=truncated_bot_text, blocks=blocks
         )
@@ -774,6 +788,41 @@ async def process_msg(event, say):
         logger.info(f"[CACHE] No reranked_nodes for ts={bot_ts}")
 
 
+def clear_escalation_claim(conv_id: str) -> None:
+    """Undo check_and_update_endorsement(..., "escalated") after a failed tech-support post."""
+    entry = ENDORSEMENT_TRACKER.get(conv_id)
+    if not entry or not entry.get("escalated"):
+        return
+    entry["escalated"] = False
+    logger.info(f"[ESCALATE ROLLBACK] Cleared escalated flag for thread {conv_id} after failed techsupport post")
+
+
+async def _notify_escalate_click_failure(client, body, orig_channel_id, orig_thread_ts, message: str) -> None:
+    """Tell the clicker the escalate action failed (ephemeral, then in-thread fallback)."""
+    clicker = (body.get("user") or {}).get("id")
+    if clicker and orig_channel_id:
+        try:
+            await client.chat_postEphemeral(
+                channel=orig_channel_id,
+                user=clicker,
+                text=message,
+                thread_ts=orig_thread_ts,
+            )
+            return
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error(f"[ESCALATE] Failed to post ephemeral error: {exc}")
+    if not orig_channel_id or not orig_thread_ts:
+        return
+    try:
+        await client.chat_postMessage(
+            channel=orig_channel_id,
+            thread_ts=orig_thread_ts,
+            text=message,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error(f"[ESCALATE] Failed to post in-thread escalate error: {exc}")
+
+
 @app.action(ESCALATE_ACTION_ID)
 async def handle_escalate_to_techsupport(ack, body, client):
     """
@@ -784,6 +833,10 @@ async def handle_escalate_to_techsupport(ack, body, client):
     the button's value, posts the escalation into the appropriate techsupport channel,
     replaces the button with a short confirmation (so it can't be clicked again), and posts
     a link-preview-free confirmation reply with a hyperlink to the new thread.
+
+    The escalated lock is claimed before history/refine I/O so a double-click cannot
+    post twice. If the tech-support post fails, the lock is rolled back so the user
+    can click again.
     """
     await ack()
 
@@ -807,6 +860,24 @@ async def handle_escalate_to_techsupport(ack, body, client):
 
     if not orig_channel_id or not orig_thread_ts:
         logger.error(f"[ESCALATE] Missing channel_id/thread_ts in button value: {payload}")
+        return
+
+    product, _ = determine_product_and_expert(orig_channel_id)
+    techsupport_channel_id = get_techsupport_channel(product)
+    if not techsupport_channel_id:
+        logger.warning(f"[ESCALATE] No techsupport channel configured for product {product} (channel {orig_channel_id})")
+        await _notify_escalate_click_failure(
+            client,
+            body,
+            orig_channel_id,
+            orig_thread_ts,
+            "Tech support escalation is not configured for this product. Please contact an administrator.",
+        )
+        return
+
+    # Claim the lock before slow I/O so two clicks cannot both refine and both post.
+    if not check_and_update_endorsement(orig_thread_ts, "escalated"):
+        logger.info(f"[ESCALATE DUPLICATE] Thread {orig_thread_ts} already escalated, skipping.")
         return
 
     # Refine the query only when there was more than one user message in the thread; a single
@@ -848,17 +919,6 @@ async def handle_escalate_to_techsupport(ack, body, client):
         f"source={escalation_query_source!r}"
     )
 
-    product, _ = determine_product_and_expert(orig_channel_id)
-    techsupport_channel_id = get_techsupport_channel(product)
-    if not techsupport_channel_id:
-        logger.warning(f"[ESCALATE] No techsupport channel configured for product {product} (channel {orig_channel_id})")
-        return
-
-    # Prevent a second click (or a race between two clicks) from creating a duplicate thread
-    if not check_and_update_endorsement(orig_thread_ts, "escalated"):
-        logger.info(f"[ESCALATE DUPLICATE] Thread {orig_thread_ts} already escalated, skipping.")
-        return
-
     # Permalink to the original question, included for context in the techsupport channel
     orig_permalink = None
     try:
@@ -896,6 +956,14 @@ async def handle_escalate_to_techsupport(ack, body, client):
         )
     except Exception as exc:  # pylint: disable=broad-except
         logger.error(f"[ESCALATE] Failed to post to techsupport channel {techsupport_channel_id}: {exc}")
+        clear_escalation_claim(orig_thread_ts)
+        await _notify_escalate_click_failure(
+            client,
+            body,
+            orig_channel_id,
+            orig_thread_ts,
+            "Could not post this question to tech support. Please try the button again, or contact an administrator.",
+        )
         return
 
     if related_entry_title:

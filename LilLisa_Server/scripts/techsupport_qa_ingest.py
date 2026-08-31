@@ -67,8 +67,12 @@ one implementation (voyage-context-3, input_type="query", 2048 dims --
 confirmed against the actual IDA_QA_PAIRS/IDDM_QA_PAIRS tables' schema in the
 local ./lancedb), so there's no risk of the two drifting out of sync.
 
-No PII stripping is performed here -- techsupport content stays Slack-only
-and is never exposed via LilLisa_Web, unlike the golden QA pairs pipeline.
+Generated title/summary text is run through redact_obvious_pii() before
+markdown/LanceDB/GitHub (emails, private IPs, Slack mentions, obvious
+secrets, INC/SR/HD/TICKET ids, internal FQDNs). Hostnames, tenant names,
+and product-specific ticket keys still need a real techsupport_qa_pairs.md
+to tune -- see beads pr42-blockers.2.3. The summarize/merge prompts also
+ask the model to omit that material; regex is the backstop.
 
 Required env vars (read from ../env/lillisa_server.env, same file the main
 server reads):
@@ -103,7 +107,9 @@ sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from github_anchor import compute_github_urls_for_titles  # noqa: E402
+from atomic_io import atomic_write_json, atomic_write_text  # noqa: E402
 from techsupport_classifier import configure_dspy_lm  # noqa: E402
+from techsupport_pii import redact_obvious_pii  # noqa: E402
 
 from src.embedding_config import VoyageEmbedding  # noqa: E402
 from src.llama_index_lancedb_vector_store import LanceDBVectorStore  # noqa: E402
@@ -183,8 +189,7 @@ def get_related_entry_title(thread_ts: str) -> Optional[str]:
 
 
 def save_review_state(state: Dict[str, Any]) -> None:
-    with open(REVIEW_STATE_PATH, "w", encoding="utf-8") as file:
-        json.dump(state, file, indent=2)
+    atomic_write_json(REVIEW_STATE_PATH, state)
 
 
 # --- Markdown parsing (deliberately separate from
@@ -198,6 +203,15 @@ def save_review_state(state: Dict[str, Any]) -> None:
 # this is a safe assumption rather than a real ambiguity risk.
 _TITLE_BLOCK_SPLIT_PATTERN = re.compile(r"(?m)^## ")
 _TITLE_SUMMARY_PATTERN = re.compile(r"(.+?)\n\n(.*)", re.DOTALL)
+
+
+def _redact_generated_title_and_summary(title: str, summary: str) -> tuple[str, str]:
+    """Run obvious-PII regex on LLM output immediately before persist."""
+    redacted_title = redact_obvious_pii(title)
+    redacted_summary = redact_obvious_pii(summary)
+    if redacted_title != title or redacted_summary != summary:
+        logger.info("Redacted obvious PII from generated techsupport title/summary")
+    return redacted_title, redacted_summary
 
 
 def parse_summary_markdown(file_content: str) -> List[Dict[str, Any]]:
@@ -270,7 +284,8 @@ class SummarizeConversationThread(dspy.Signature):
             "including the specific steps or fix that resolved the issue, phrased generally "
             "enough to be useful for similar future issues. Write it as standalone prose -- "
             "do not frame it as a question/answer pair, and do not reference the Slack "
-            "thread, usernames, timestamps, or the fact this came from a conversation."
+            "thread, usernames, timestamps, or the fact this came from a conversation. "
+            "Omit emails, hostnames, IP addresses, ticket IDs, tenant/customer names, and secrets."
         )
     )
 
@@ -284,7 +299,8 @@ class GenerateTechsupportTitle(dspy.Signature):
         desc=(
             "A short (roughly 3-7 word) descriptive title capturing the summary's technical "
             "topic, e.g. 'Zookeeper GC Logging Configuration'. Do not use markdown formatting "
-            "(no '#' characters) and do not start the title itself with a heading marker."
+            "(no '#' characters) and do not start the title itself with a heading marker. "
+            "Do not include emails, hostnames, IP addresses, ticket IDs, or customer names."
         )
     )
 
@@ -305,7 +321,8 @@ class MergeTechsupportSummaries(dspy.Signature):
             "existing summary that the new insight doesn't contradict. Write it as a single "
             "self-contained technical summary, standalone prose, not a question/answer pair, "
             "and do not reference the Slack thread, usernames, timestamps, or the fact this "
-            "came from a conversation."
+            "came from a conversation. Omit emails, hostnames, IP addresses, ticket IDs, "
+            "tenant/customer names, and secrets."
         )
     )
 
@@ -327,8 +344,8 @@ def append_summary_to_markdown(title: str, summary: str) -> Path:
     filepath = VERIFIED_TECHSUPPORT_QA_FOLDERPATH / TECHSUPPORT_QA_MARKDOWN_FILENAME
 
     block = f"## {title}\n\n{summary}\n\n"
-    with open(filepath, "a", encoding="utf-8") as file:
-        file.write(block)
+    existing = filepath.read_text(encoding="utf-8") if filepath.exists() else ""
+    atomic_write_text(filepath, existing + block)
     return filepath
 
 
@@ -352,7 +369,7 @@ def replace_summary_in_markdown(index: int, title: str, summary: str) -> Path:
         f"## {entry['title']}\n\n{entry['summary']}\n\n"
         for entry in entries
     )
-    filepath.write_text(content, encoding="utf-8")
+    atomic_write_text(filepath, content)
     return filepath
 
 
@@ -484,8 +501,14 @@ def add_verified_qa_pair(conversation_thread: str, thread_ts: Optional[str] = No
     reply to the same thread can be found again and used to REPLACE this
     entry in place -- see replace_verified_qa_pair() / find_entry_index_for_thread().
     """
+    if thread_ts and find_entry_index_for_thread(thread_ts) is not None:
+        # Retry after a crash that wrote markdown/LanceDB but not added_to_verified_db:
+        # replace in place instead of appending a duplicate.
+        return replace_verified_qa_pair(thread_ts, conversation_thread)
+
     summary = summarize_conversation(conversation_thread=conversation_thread).summary.strip()
     title = generate_title(summary=summary).title.strip()
+    title, summary = _redact_generated_title_and_summary(title, summary)
 
     # The new entry's ordinal is its position in the markdown file as it
     # exists right now -- NOT len(review_state["entries"]), which would be
@@ -551,6 +574,7 @@ def replace_verified_qa_pair(thread_ts: str, conversation_thread: str) -> Dict[s
 
     summary = summarize_conversation(conversation_thread=conversation_thread).summary.strip()
     title = generate_title(summary=summary).title.strip()
+    title, summary = _redact_generated_title_and_summary(title, summary)
 
     review_state = load_review_state()
     old_node_ids = review_state["entries"][str(entry_index)]["node_ids"]
@@ -562,7 +586,6 @@ def replace_verified_qa_pair(thread_ts: str, conversation_thread: str) -> Dict[s
     vector_store = LanceDBVectorStore(
         connection=db, uri=lancedb_folderpath, table_name=TECHSUPPORT_QA_TABLE_NAME, query_type="hybrid"
     )
-    vector_store.delete_nodes(old_node_ids)
 
     markdown_path = replace_summary_in_markdown(entry_index, title, summary)
     github_url = _compute_github_url_for_entry(entry_index, markdown_path)
@@ -570,6 +593,9 @@ def replace_verified_qa_pair(thread_ts: str, conversation_thread: str) -> Dict[s
 
     review_state["entries"][str(entry_index)] = {"node_ids": lancedb_result["node_ids"], "thread_ts": thread_ts}
     save_review_state(review_state)
+    # Insert-then-delete: a crash in the gap may leave a brief duplicate row, not a hole
+    # with nothing retrievable until retry.
+    vector_store.delete_nodes(old_node_ids)
 
     return {
         "title": title,
@@ -608,10 +634,13 @@ def enrich_verified_entry(existing_title: str, new_thread_conversation: str) -> 
         raise LookupError(f"No existing verified entry titled {existing_title!r} -- cannot enrich")
 
     existing_summary = entries[entry_index]["summary"]
-    new_insight_summary = summarize_conversation(conversation_thread=new_thread_conversation).summary.strip()
+    new_insight_summary = redact_obvious_pii(
+        summarize_conversation(conversation_thread=new_thread_conversation).summary.strip()
+    )
     merged_summary = merge_techsupport_summaries(
         existing_summary=existing_summary, new_insight=new_insight_summary
     ).merged_summary.strip()
+    merged_summary = redact_obvious_pii(merged_summary)
 
     review_state = load_review_state()
     existing_entry_state = review_state["entries"].get(str(entry_index), {})
@@ -624,8 +653,6 @@ def enrich_verified_entry(existing_title: str, new_thread_conversation: str) -> 
     vector_store = LanceDBVectorStore(
         connection=db, uri=lancedb_folderpath, table_name=TECHSUPPORT_QA_TABLE_NAME, query_type="hybrid"
     )
-    if old_node_ids:
-        vector_store.delete_nodes(old_node_ids)
 
     # Title unchanged -- see docstring: this is what keeps the GitHub anchor stable.
     markdown_path = replace_summary_in_markdown(entry_index, existing_title, merged_summary)
@@ -640,6 +667,8 @@ def enrich_verified_entry(existing_title: str, new_thread_conversation: str) -> 
         "thread_ts": existing_entry_state.get("thread_ts"),
     }
     save_review_state(review_state)
+    if old_node_ids:
+        vector_store.delete_nodes(old_node_ids)
 
     return {
         "title": existing_title,

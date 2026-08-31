@@ -37,3 +37,4 @@ tasks/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+lil-lisa/build/app_envfiles/lil-lisa.env

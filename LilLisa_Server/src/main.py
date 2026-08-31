@@ -90,6 +90,9 @@ class ChunkingStrategy(Enum):
 REACT_AGENT_PROMPT = None  # Path to the React agent prompt file
 LANCEDB_FOLDERPATH = None  # Path to the LanceDB folder
 AUTHENTICATION_KEY = None  # Authentication key for JWT
+# Max character length of conversation_history posted to /refine_escalation_query/.
+# Long enough for a real multi-turn Slack session; short enough to reject LLM cost/DoS padding.
+REFINE_ESCALATION_MAX_CHARS = 32768
 DOCUMENTATION_FOLDERPATH = None  # Path to the documentation folder
 QA_PAIRS_GITHUB_REPO_URL = None  # URL of the GitHub repository for QA pairs
 QA_PAIRS_FOLDERPATH = None  # Path to the QA pairs folder
@@ -1151,8 +1154,13 @@ async def reload_techsupport_qa_pairs(encrypted_key: str) -> dict:
 TECHSUPPORT_THREAD_TAGS_PATH = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "techsupport_thread_tags.json"
 
 
+def _require_jwt(encrypted_key: str) -> None:
+    """Same AUTHENTICATION_KEY check used by /reload_techsupport_qa_pairs/ and golden-QA admin routes."""
+    jwt.decode(encrypted_key, AUTHENTICATION_KEY, algorithms="HS256")
+
+
 @app.post("/tag_techsupport_thread/", response_model=str, response_class=PlainTextResponse)
-async def tag_techsupport_thread(thread_ts: str, related_entry_title: str) -> str:
+async def tag_techsupport_thread(thread_ts: str, related_entry_title: str, encrypted_key: str) -> str:
     """
     Records that a newly-created techsupport escalation thread is related to an existing
     verified techsupport entry, so the nightly pipeline can merge new insight into that
@@ -1162,20 +1170,24 @@ async def tag_techsupport_thread(thread_ts: str, related_entry_title: str) -> st
     Args:
         thread_ts (str): Slack ts of the newly-created techsupport channel thread.
         related_entry_title (str): Title of the existing verified entry this thread relates to.
+        encrypted_key (str): JWT key for authentication (same secret as /reload_techsupport_qa_pairs/).
 
     Returns:
         str: "ok" on success.
 
     Raises:
-        HTTPException: On internal errors.
+        HTTPException: 401 on bad JWT, 500 on internal errors.
     """
     try:
+        _require_jwt(encrypted_key)
         tags = {}
         if TECHSUPPORT_THREAD_TAGS_PATH.exists():
             tags = json.loads(TECHSUPPORT_THREAD_TAGS_PATH.read_text(encoding="utf-8"))
         tags[thread_ts] = related_entry_title
         TECHSUPPORT_THREAD_TAGS_PATH.write_text(json.dumps(tags, indent=2), encoding="utf-8")
         return "ok"
+    except jwt.exceptions.InvalidSignatureError as e:
+        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
     except Exception as exc:
         utils.logger.error("Failed to tag techsupport thread %s: %s", thread_ts, exc)
         raise HTTPException(status_code=500, detail="Failed to tag techsupport thread") from exc
@@ -1306,22 +1318,26 @@ async def record_endorsement(
         ) from exc
 
 @app.get("/get_conversation_history/", response_model=str, response_class=PlainTextResponse)
-async def get_conversation_history(session_id: str) -> str:
+async def get_conversation_history(session_id: str, encrypted_key: str) -> str:
     """
     Retrieves the full conversation history for a session, formatted as one "Poster: message" line per turn.
 
     Args:
         session_id (str): Unique identifier for the session.
+        encrypted_key (str): JWT key for authentication (same secret as /reload_techsupport_qa_pairs/).
 
     Returns:
         str: The session's conversation history, e.g. "User: ...\\nAssistant: ...".
 
     Raises:
-        HTTPException: 404 if the session doesn't exist, 500 on other internal errors.
+        HTTPException: 401 on bad JWT, 404 if the session doesn't exist, 500 on other internal errors.
     """
     try:
+        _require_jwt(encrypted_key)
         llsc = get_llsc(session_id)
         return "\n".join(f"{poster}: {message}" for poster, message, _ in llsc.conversation_history)
+    except jwt.exceptions.InvalidSignatureError as e:
+        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=f"No existing session found for session_id: {session_id}") from exc
     except HTTPException as exc:
@@ -1334,22 +1350,34 @@ async def get_conversation_history(session_id: str) -> str:
 
 
 @app.post("/refine_escalation_query/", response_model=str, response_class=PlainTextResponse)
-async def refine_escalation_query_endpoint(conversation_history: str = Body(..., embed=True)) -> str:
+async def refine_escalation_query_endpoint(
+    encrypted_key: str, conversation_history: str = Body(..., embed=True)
+) -> str:
     """
     Combines all of a user's messages in a conversation thread into a single, faithful question,
     for use when escalating the thread to tech support. See refine_escalation_query() for details.
 
     Args:
-        conversation_history (str): The full conversation history for the thread being escalated.
+        encrypted_key (str): JWT key for authentication (same secret as /reload_techsupport_qa_pairs/).
+        conversation_history (str): The full conversation history for the thread being escalated
+            (max REFINE_ESCALATION_MAX_CHARS characters).
 
     Returns:
         str: The refined, single question text.
 
     Raises:
-        HTTPException: On internal errors.
+        HTTPException: 401 on bad JWT, 413 if conversation_history is too large, 500 on internal errors.
     """
     try:
+        _require_jwt(encrypted_key)
+        if len(conversation_history) > REFINE_ESCALATION_MAX_CHARS:
+            raise HTTPException(
+                status_code=413,
+                detail=f"conversation_history exceeds {REFINE_ESCALATION_MAX_CHARS} characters",
+            )
         return refine_escalation_query(conversation_history)
+    except jwt.exceptions.InvalidSignatureError as e:
+        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
     except HTTPException as exc:
         raise exc
     except Exception as exc:

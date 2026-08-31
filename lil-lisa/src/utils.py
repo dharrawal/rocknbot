@@ -1,10 +1,37 @@
 """ utility functions """
 
+import json
 import logging
 import os
 from datetime import datetime, timezone
 from time import time_ns
-from typing import Optional
+from typing import Any, Dict, Optional
+
+
+def parse_get_ans_result(raw_result: str) -> Dict[str, Any]:
+    """Parse LilLisa_Server /invoke/ JSON.
+
+    get_ans() returns a JSON object on success, but a plain English string on
+    timeout/exception. json.loads() of that string must not crash process_msg
+    and leave Slack showing only "Processing...".
+    """
+    try:
+        parsed = json.loads(raw_result)
+    except (json.JSONDecodeError, TypeError):
+        return {
+            "response": str(raw_result),
+            "links_text": "",
+            "reranked_nodes": [],
+            "needs_escalation": False,
+        }
+    if not isinstance(parsed, dict):
+        return {
+            "response": str(raw_result),
+            "links_text": "",
+            "reranked_nodes": [],
+            "needs_escalation": False,
+        }
+    return parsed
 
 
 def get_env_variable(var_name: str, default: Optional[str] = None) -> str:

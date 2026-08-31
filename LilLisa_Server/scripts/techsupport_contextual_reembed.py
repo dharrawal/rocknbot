@@ -96,6 +96,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from github_anchor import compute_github_urls_for_titles  # noqa: E402
+from atomic_io import atomic_write_json  # noqa: E402
 
 from src.embedding_config import VOYAGE_EMBEDDING_DIMENSION, VoyageEmbedding  # noqa: E402
 from src.llama_index_lancedb_vector_store import LanceDBVectorStore  # noqa: E402
@@ -188,8 +189,7 @@ def load_state() -> Dict[str, Any]:
 
 
 def save_state(state: Dict[str, Any]) -> None:
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, sort_keys=True)
+    atomic_write_json(STATE_PATH, state, indent=2, sort_keys=True)
 
 
 def is_reembed_due(state: Dict[str, Any]) -> bool:
