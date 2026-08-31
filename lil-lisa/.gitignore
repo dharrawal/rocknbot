@@ -9,6 +9,9 @@
 # Ignore app environment files
 app_envfiles/
 
+# Ignore tool-specific credential env files (e.g. production harvest tokens)
+tools/env/
+
 # Ignore Docker ignore files
 .dockerignore
 

@@ -7,6 +7,18 @@
 # Ignore app environment files
 env/
 
+# Ignore nightly techsupport sync local state
+scripts/techsupport_sync_state.json
+
+# Ignore techsupport contextual re-embed local state
+scripts/techsupport_reembed_state.json
+
+# Ignore techsupport expert-review sync local state
+scripts/techsupport_review_state.json
+
+# Ignore techsupport escalation-thread related-entry tags local state
+scripts/techsupport_thread_tags.json
+
 # Ignore Docker ignore files
 .dockerignore
 
@@ -29,3 +41,9 @@ lancedb/*/_indices
 
 # Ignore passwords
 passwords/
+
+# Ignore production Slack harvest test-pull output
+data/historical_import/production_test_pull*.txt
+
+# Ignore test-workspace Slack harvest pull output
+data/historical_import/test_harvest_pull*.txt
