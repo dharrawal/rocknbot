@@ -13,10 +13,7 @@ LDB_TAG=2.6.0
 
 .EXPORT_ALL_VARIABLES:
 
-.PHONY: _include-env
-
-_include-env:
-    include ./env/lillisa_server.env
+-include ./env/lillisa_server.env
 
 _wait30s:
 	@echo "lets wait 30 sec..."
