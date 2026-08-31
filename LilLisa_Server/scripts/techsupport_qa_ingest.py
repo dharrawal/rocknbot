@@ -81,8 +81,9 @@ server reads):
                                containing the Voyage AI API key
 
 Usage (as a library):
-    from techsupport_qa_ingest import add_verified_qa_pair
+    from techsupport_qa_ingest import add_verified_qa_pair, generate_verified_title_and_summary
     result = add_verified_qa_pair(conversation_thread)
+    preview = generate_verified_title_and_summary(conversation_thread)  # no markdown/LanceDB writes
 """
 
 import json
@@ -110,6 +111,7 @@ from github_anchor import compute_github_urls_for_titles  # noqa: E402
 from atomic_io import atomic_write_json, atomic_write_text  # noqa: E402
 from techsupport_classifier import configure_dspy_lm  # noqa: E402
 from techsupport_pii import redact_obvious_pii  # noqa: E402
+from techsupport_review_state import node_ids_from_review_entry, review_entry_state  # noqa: E402
 
 from src.embedding_config import VoyageEmbedding  # noqa: E402
 from src.llama_index_lancedb_vector_store import LanceDBVectorStore  # noqa: E402
@@ -332,6 +334,23 @@ generate_title = dspy.Predict(GenerateTechsupportTitle)
 merge_techsupport_summaries = dspy.Predict(MergeTechsupportSummaries)
 
 
+def generate_verified_title_and_summary(conversation_thread: str) -> Dict[str, str]:
+    """Public API: summarize a classified (useful + conclusive) thread and
+    generate a short title, then run obvious-PII redaction.
+
+    This is the generation path add_verified_qa_pair() / replace_verified_qa_pair()
+    use before they persist. Callers that must not write markdown or LanceDB
+    (e.g. historical_import_production.py --dry-run) should use this rather
+    than invoking the module-level dspy.Predict instances directly.
+
+    Returns {"title", "summary"}.
+    """
+    summary = summarize_conversation(conversation_thread=conversation_thread).summary.strip()
+    title = generate_title(summary=summary).title.strip()
+    title, summary = _redact_generated_title_and_summary(title, summary)
+    return {"title": title, "summary": summary}
+
+
 # --- Markdown append ---
 
 
@@ -506,9 +525,8 @@ def add_verified_qa_pair(conversation_thread: str, thread_ts: Optional[str] = No
         # replace in place instead of appending a duplicate.
         return replace_verified_qa_pair(thread_ts, conversation_thread)
 
-    summary = summarize_conversation(conversation_thread=conversation_thread).summary.strip()
-    title = generate_title(summary=summary).title.strip()
-    title, summary = _redact_generated_title_and_summary(title, summary)
+    generated = generate_verified_title_and_summary(conversation_thread)
+    title, summary = generated["title"], generated["summary"]
 
     # The new entry's ordinal is its position in the markdown file as it
     # exists right now -- NOT len(review_state["entries"]), which would be
@@ -572,12 +590,12 @@ def replace_verified_qa_pair(thread_ts: str, conversation_thread: str) -> Dict[s
             "(likely added before thread_ts tracking existed, or added outside this pipeline)"
         )
 
-    summary = summarize_conversation(conversation_thread=conversation_thread).summary.strip()
-    title = generate_title(summary=summary).title.strip()
-    title, summary = _redact_generated_title_and_summary(title, summary)
+    generated = generate_verified_title_and_summary(conversation_thread)
+    title, summary = generated["title"], generated["summary"]
 
     review_state = load_review_state()
-    old_node_ids = review_state["entries"][str(entry_index)]["node_ids"]
+    existing_entry_state = review_entry_state(review_state, entry_index)
+    old_node_ids = node_ids_from_review_entry(existing_entry_state)
 
     configure_embedding_model()
     env = load_pipeline_env()
@@ -594,8 +612,10 @@ def replace_verified_qa_pair(thread_ts: str, conversation_thread: str) -> Dict[s
     review_state["entries"][str(entry_index)] = {"node_ids": lancedb_result["node_ids"], "thread_ts": thread_ts}
     save_review_state(review_state)
     # Insert-then-delete: a crash in the gap may leave a brief duplicate row, not a hole
-    # with nothing retrievable until retry.
-    vector_store.delete_nodes(old_node_ids)
+    # with nothing retrievable until retry. Skip delete when the state file has no
+    # tracked node_ids (corrupt/partial write, or an entry predating this field).
+    if old_node_ids:
+        vector_store.delete_nodes(old_node_ids)
 
     return {
         "title": title,
@@ -643,8 +663,8 @@ def enrich_verified_entry(existing_title: str, new_thread_conversation: str) -> 
     merged_summary = redact_obvious_pii(merged_summary)
 
     review_state = load_review_state()
-    existing_entry_state = review_state["entries"].get(str(entry_index), {})
-    old_node_ids = existing_entry_state.get("node_ids", [])
+    existing_entry_state = review_entry_state(review_state, entry_index)
+    old_node_ids = node_ids_from_review_entry(existing_entry_state)
 
     configure_embedding_model()
     env = load_pipeline_env()

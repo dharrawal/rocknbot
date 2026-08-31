@@ -72,12 +72,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("techsupport_review_sync")
 
 
+def _sql_string_literal(value: Any) -> str:
+    """SQL string literal for LanceDB where predicates.
+
+    LanceDB's Python API takes a SQL predicate string; it does not expose
+    bound parameters for search().where(). Single quotes are doubled per SQL.
+    """
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def _row_matches_current_text(table: Any, node_ids: List[str], title: str, summary: str) -> bool:
     """True if every node_id already reflects the markdown's current
     title/summary text -- i.e. nothing left to do for this entry."""
     if not node_ids:
         return False
-    id_list = ", ".join(f"'{node_id}'" for node_id in node_ids)
+    id_list = ", ".join(_sql_string_literal(node_id) for node_id in node_ids)
     matches = table.search().where(f"id in ({id_list})").to_pandas()
     if len(matches) != len(node_ids):
         return False  # a row went missing somehow -- treat as needing re-sync

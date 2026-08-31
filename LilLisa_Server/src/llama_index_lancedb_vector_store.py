@@ -41,6 +41,19 @@ from src import utils
 _logger = logging.getLogger(__name__)
 
 
+def _sql_string_literal(value: Any) -> str:
+    """SQL string literal for LanceDB delete/where predicates.
+
+    LanceDB's Python API takes a SQL predicate string; it does not expose
+    bound parameters. Single quotes are doubled per SQL.
+    """
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _sql_in_clause(column: str, values: List[Any]) -> str:
+    return f"{column} in ({', '.join(_sql_string_literal(v) for v in values)})"
+
+
 def _to_lance_filter(standard_filters: MetadataFilters, metadata_keys: list) -> Any:
     """Translate standard metadata filters to Lance specific spec."""
     filters = []
@@ -272,13 +285,15 @@ class LanceDBVectorStore(BasePydanticVectorStore):
         """
         Delete nodes using the ref_doc_id.
         """
-        self._table.delete(f'{self.doc_id_key} = "' + ref_doc_id + '"')
+        self._table.delete(f"{self.doc_id_key} = {_sql_string_literal(ref_doc_id)}")
 
     def delete_nodes(self, node_ids: List[str], **delete_kwargs: Any) -> None:
         """
         Delete nodes using a list of node_ids.
         """
-        self._table.delete('id in ("' + '","'.join(node_ids) + '")')
+        if not node_ids:
+            return
+        self._table.delete(_sql_in_clause("id", node_ids))
 
     def get_nodes(
         self,
@@ -298,7 +313,9 @@ class LanceDBVectorStore(BasePydanticVectorStore):
         else:
             where = kwargs.pop("where", None)
         if node_ids is not None:
-            where = 'id in ("' + '","'.join(node_ids) + '")'
+            if not node_ids:
+                return []
+            where = _sql_in_clause("id", node_ids)
         results = self._table.search().where(where).to_pandas()
         nodes = []
         for _, item in results.iterrows():

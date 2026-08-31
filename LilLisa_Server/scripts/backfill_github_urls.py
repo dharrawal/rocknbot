@@ -85,6 +85,15 @@ from techsupport_contextual_reembed import (  # noqa: E402
 )
 
 
+def _sql_string_literal(value: Any) -> str:
+    """SQL string literal for LanceDB delete/where predicates.
+
+    LanceDB's Python API takes a SQL predicate string; it does not expose
+    bound parameters for table.delete(). Single quotes are doubled per SQL.
+    """
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def build_title_to_url_map() -> Dict[str, str]:
     """Parses the current techsupport_qa_pairs.md and returns {title:
     github_url}, computed via the real GitHub duplicate-heading slug
@@ -151,7 +160,7 @@ def run(dry_run: bool = False) -> Dict[str, Any]:
             "text": row["text"],
             "metadata": flat_metadata,
         }
-        table.delete(f"id = '{row['id']}'")
+        table.delete(f"id = {_sql_string_literal(row['id'])}")
         table.add([new_row])
 
     counts["title_not_found_examples"] = title_not_found_examples

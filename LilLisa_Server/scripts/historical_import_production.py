@@ -114,8 +114,7 @@ from nightly_techsupport_sync import load_env  # noqa: E402
 from techsupport_classifier import classify_thread  # noqa: E402
 from techsupport_qa_ingest import (  # noqa: E402
     add_verified_qa_pair,
-    generate_title,
-    summarize_conversation,
+    generate_verified_title_and_summary,
 )
 import techsupport_contextual_reembed  # noqa: E402
 
@@ -216,11 +215,10 @@ def process_conversation(conv: Dict[str, Any], slack_token: Optional[str], dry_r
     Raises on LLM/parsing failure -- the caller records that as a retryable
     "error" outcome.
 
-    In dry-run mode, an "added" outcome still runs the real
-    SummarizeConversationThread + GenerateTechsupportTitle calls (imported
-    directly, same dspy.Predict instances add_verified_qa_pair() itself
-    calls) so the preview is the real generated content -- it just skips the
-    markdown/LanceDB writes add_verified_qa_pair() would otherwise perform.
+    In dry-run mode, an "added" outcome still runs the same public
+    generate_verified_title_and_summary() path add_verified_qa_pair() uses
+    (summarize, title, PII redaction) so the preview matches persisted
+    content -- it just skips the markdown/LanceDB writes.
     """
     messages = to_slack_messages(conv)
     result = classify_thread(messages, slack_token=slack_token)
@@ -231,9 +229,8 @@ def process_conversation(conv: Dict[str, Any], slack_token: Optional[str], dry_r
         return {"outcome": "skipped_not_conclusive"}
 
     if dry_run:
-        summary = summarize_conversation(conversation_thread=result["conversation_thread"]).summary.strip()
-        title = generate_title(summary=summary).title.strip()
-        return {"outcome": "added", "title": title, "summary": summary}
+        generated = generate_verified_title_and_summary(result["conversation_thread"])
+        return {"outcome": "added", "title": generated["title"], "summary": generated["summary"]}
 
     add_result = add_verified_qa_pair(result["conversation_thread"], thread_ts=f"historical::{conv['id']}")
     return {"outcome": "added", "title": add_result["title"], "summary": add_result["summary"]}

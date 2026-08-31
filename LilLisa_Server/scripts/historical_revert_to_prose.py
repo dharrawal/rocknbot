@@ -158,17 +158,16 @@ def _generate_title_with_retry(summary: str) -> str:
     """generate_title() wrapped with backoff for transient provider rate
     limits (seen in practice against the Mistral endpoint) -- dspy's own
     internal retries aren't enough to ride out a sustained rate-limit window."""
-    last_exc: Optional[Exception] = None
     for attempt in range(1, MAX_TITLE_RETRIES + 1):
         try:
             return generate_title(summary=summary).title.strip()
         except Exception as exc:  # noqa: BLE001 -- retry on any transient provider error
-            last_exc = exc
-            if attempt < MAX_TITLE_RETRIES:
-                wait_seconds = RETRY_BACKOFF_SECONDS * attempt
-                print(f"(attempt {attempt} failed: {exc!r} -- retrying in {wait_seconds}s)", end=" ", flush=True)
-                time.sleep(wait_seconds)
-    raise last_exc  # type: ignore[misc]
+            if attempt >= MAX_TITLE_RETRIES:
+                raise
+            wait_seconds = RETRY_BACKOFF_SECONDS * attempt
+            print(f"(attempt {attempt} failed: {exc!r} -- retrying in {wait_seconds}s)", end=" ", flush=True)
+            time.sleep(wait_seconds)
+    raise RuntimeError("title generation failed after retries with no exception")
 
 
 def generate_titles(entries: List[Dict[str, Any]], limit: Optional[int] = None, dry_run: bool = False) -> tuple:
