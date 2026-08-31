@@ -914,7 +914,7 @@ def invoke(
             _no_answer_streak[session_id] = _no_answer_streak.get(session_id, 0) + 1
         needs_escalation = not answer_found
 
-        utils.logger.info(
+        utils.logger.debug(
             "DEBUG_NO_ANSWER | session_id=%s answer_found=%s no_answer_streak=%s needs_escalation=%s response_text=%r",
             session_id, answer_found, _no_answer_streak.get(session_id, 0), needs_escalation, response_text,
         )

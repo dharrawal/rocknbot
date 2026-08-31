@@ -710,7 +710,7 @@ async def process_msg(event, say):
     reranked_nodes = parsed.get("reranked_nodes", [])
     needs_escalation = parsed.get("needs_escalation", False)
     primary_techsupport_match_title = parsed.get("primary_techsupport_match_title")
-    logger.info(
+    logger.debug(
         f"DEBUG_NO_ANSWER | parsed keys={list(parsed.keys())} "
         f"needs_escalation={needs_escalation!r} bot_text={bot_text!r}"
     )

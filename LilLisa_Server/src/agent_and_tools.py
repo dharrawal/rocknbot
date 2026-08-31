@@ -711,7 +711,7 @@ def answer_from_document_retrieval(
     utils.logger.debug("PERF | answer_generation_llm | %.3fs", time.perf_counter() - t0_llm)
 
     no_answer_marker = "[[NO_ANSWER]]"
-    utils.logger.info("DEBUG_NO_ANSWER | raw llm_response before stripping: %r", llm_response)
+    utils.logger.debug("DEBUG_NO_ANSWER | raw llm_response before stripping: %r", llm_response)
 
     # Mistral's hosted inference layer has been observed to non-deterministically emit
     # [[NO_ANSWER]] on identical input even at temperature=0 (confirmed: the same prompt
@@ -751,7 +751,7 @@ def answer_from_document_retrieval(
         llm_response = llm_response[marker_index + len(no_answer_marker):].lstrip()
     else:
         answer_found = True
-    utils.logger.info(
+    utils.logger.debug(
         "DEBUG_NO_ANSWER | marker_stripped=%s answer_found=%s final llm_response: %r",
         not answer_found,
         answer_found,
