@@ -22,7 +22,6 @@ import jwt
 import litellm
 import tiktoken
 import uvicorn
-import voyageai
 from fastapi import FastAPI, HTTPException, status, BackgroundTasks, Request, Response, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
@@ -47,7 +46,6 @@ from llama_index.core.ingestion import IngestionPipeline
 from llama_index.core.llms import LLM, ChatMessage, ChatResponse, LLMMetadata
 from llama_index.core.node_parser import MarkdownNodeParser, SentenceSplitter
 from llama_index.core.tools import FunctionTool
-from llama_index.core.embeddings import BaseEmbedding
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.llms.openai import OpenAI as OpenAI_Llama
 from speedict import Rdict
@@ -64,10 +62,12 @@ from src.agent_and_tools import (
     get_matching_versions,
     handle_user_answer,
     improve_query,
+    refine_escalation_query,
     create_lancedb_retrievers_and_indices,
     create_docdbs_lancedb_retrievers_and_indices,
     create_qa_pairs_lancedb_retrievers_and_indices,
 )
+from src.embedding_config import VoyageEmbedding, VOYAGE_EMBEDDING_DIMENSION
 from src.lillisa_server_context import LOCALE, LilLisaServerContext
 from src.llama_index_lancedb_vector_store import LanceDBVectorStore
 from src.llama_index_markdown_reader import MarkdownReader
@@ -103,9 +103,6 @@ MAX_ITERATIONS = None  # Maximum number of iterations for the ReAct agent
 LLM_MODEL = None  # Model name
 SESSION_LIFETIME_DAYS = None  # Session lifetime in days
 CURRENT_CHUNKING_STRATEGY = ChunkingStrategy.CONTEXTUAL  # Current active chunking strategy
-
-# Voyage AI configuration
-VOYAGE_EMBEDDING_DIMENSION = 2048  # Embedding dimension for Voyage AI model
 
 # Humorous placeholder messages streamed as "thinking" indicators while the pipeline runs
 THINKING_MESSAGES = [
@@ -411,84 +408,6 @@ class StreamingReActAgent(ReActAgent):
 
 
 # -----------------------------------------------------------------------------
-# Custom Voyage Embedding Implementation
-# -----------------------------------------------------------------------------
-class VoyageEmbedding(BaseEmbedding):
-    """Voyage AI embedding implementation."""
-    
-    model_name: str = "voyage-context-3"
-    output_dimension: int = VOYAGE_EMBEDDING_DIMENSION
-    client: voyageai.Client = None
-    
-    def __init__(self, model: str = "voyage-context-3", output_dimension: int = VOYAGE_EMBEDDING_DIMENSION, **kwargs):
-        super().__init__(**kwargs)
-        self.model_name = model
-        self.output_dimension = output_dimension
-        # Direct client initialization - no lazy loading needed
-        self.client = voyageai.Client()
-    
-    def _get_query_embedding(self, query: str) -> List[float]:
-        """Get embedding for a single query - direct API call."""
-        result = self.client.contextualized_embed(
-            inputs=[[query]], 
-            model=self.model_name, 
-            input_type="query",
-            output_dimension=self.output_dimension
-        )
-        return result.results[0].embeddings[0]
-    
-    def _get_text_embedding(self, text: str) -> List[float]:
-        """Get embedding for a single text (used for queries)."""
-        return self._get_query_embedding(text)
-    
-    def _get_text_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Get embeddings for multiple texts - direct batch API call."""
-        inputs = [[text] for text in texts]
-        result = self.client.contextualized_embed(
-            inputs=inputs, 
-            model=self.model_name, 
-            input_type="query",
-            output_dimension=self.output_dimension
-        )
-        return [res.embeddings[0] for res in result.results]
-    
-    # Required async methods for BaseEmbedding compatibility
-    async def _aget_query_embedding(self, query: str) -> List[float]:
-        """Async version - just calls sync method since Voyage client is sync."""
-        return self._get_query_embedding(query)
-    
-    async def _aget_text_embedding(self, text: str) -> List[float]:
-        """Async version - just calls sync method since Voyage client is sync."""
-        return self._get_text_embedding(text)
-    
-    async def _aget_text_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Async version - just calls sync method since Voyage client is sync."""
-        return self._get_text_embeddings(texts)
-
-    @classmethod
-    def get_contextualized_embeddings(cls, documents_chunks: List[List[str]], model: str = "voyage-context-3", output_dimension: int = VOYAGE_EMBEDDING_DIMENSION) -> List[List[List[float]]]:
-        """
-        Get contextualized embeddings for document chunks.
-        
-        Args:
-            documents_chunks: List of documents, where each document is a list of chunks
-            model: Voyage model name
-            output_dimension: Output dimension for embeddings
-            
-        Returns:
-            List of embeddings for each document, where each document contains embeddings for its chunks
-        """
-        client = voyageai.Client()
-        result = client.contextualized_embed(
-            inputs=documents_chunks,
-            model=model,
-            input_type="document",
-            output_dimension=output_dimension
-        )
-        return [res.embeddings for res in result.results]
-
-
-# -----------------------------------------------------------------------------
 # Application Lifecycle Management
 # -----------------------------------------------------------------------------
 @asynccontextmanager
@@ -672,6 +591,10 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
+# Tracks, per session_id, how many consecutive "answer_found: false" responses
+# have occurred in a row. Used to flag escalation after one rephrase attempt.
+_no_answer_streak: dict[str, int] = {}
 
 @app.middleware("http")
 async def custom_metrics(request: Request, call_next):
@@ -971,10 +894,30 @@ def invoke(
         try:
             response_dict = json.loads(raw_response)
             response_text = response_dict.get("response", raw_response)
+            match_context_text = response_dict.get("match_context_text", "")
+            links_text = response_dict.get("links_text", "")
             nodes = response_dict.get("reranked_nodes", [])
+            answer_found = response_dict.get("answer_found", True)
+            primary_techsupport_match_title = response_dict.get("primary_techsupport_match_title")
         except json.JSONDecodeError:
             response_text = raw_response
+            match_context_text = ""
+            links_text = ""
             nodes = []
+            answer_found = True
+            primary_techsupport_match_title = None
+
+        # Track consecutive "answer not found" responses per session (kept for logging/analytics).
+        if answer_found:
+            _no_answer_streak[session_id] = 0
+        else:
+            _no_answer_streak[session_id] = _no_answer_streak.get(session_id, 0) + 1
+        needs_escalation = not answer_found
+
+        utils.logger.info(
+            "DEBUG_NO_ANSWER | session_id=%s answer_found=%s no_answer_streak=%s needs_escalation=%s response_text=%r",
+            session_id, answer_found, _no_answer_streak.get(session_id, 0), needs_escalation, response_text,
+        )
 
         # Add assistant and user response to conversation history
         llsc.add_to_conversation_history("Assistant", response_text, query_id)
@@ -993,8 +936,13 @@ def invoke(
         # Return JSON response
         return JSONResponse(content={
             "response": response_text,
+            "match_context_text": match_context_text,
+            "links_text": links_text,
             "reranked_nodes": nodes,
-            "query_id": query_id
+            "query_id": query_id,
+            "answer_found": answer_found,
+            "needs_escalation": needs_escalation,
+            "primary_techsupport_match_title": primary_techsupport_match_title
         },headers=custom_headers)
 
     except HTTPException as exc:
@@ -1160,6 +1108,79 @@ async def _add_qa_pair_to_lancedb(question: str, answer: str, product: str):
         raise
 
 
+@app.post("/reload_techsupport_qa_pairs/", response_model=dict, response_class=JSONResponse)
+async def reload_techsupport_qa_pairs(encrypted_key: str) -> dict:
+    """
+    Rebuilds the in-memory QA pairs retrievers/indices (including
+    TECHSUPPORT_QA_PAIRS) from the current on-disk LanceDB tables.
+
+    scripts/nightly_pipeline.py and scripts/techsupport_qa_ingest.py write new
+    verified techsupport entries directly to LanceDB, entirely out-of-process
+    from this server -- unlike add_expert_qa_pair above, which is called from
+    within a running request here. Without this endpoint, a long-running
+    server process's TECHSUPPORT_QA_PAIRS_RETRIEVER stays frozen at whatever
+    it was at last startup (or last call to this endpoint / add_expert_qa_pair
+    / update_golden_qa_pairs, which all rebuild via the same
+    create_qa_pairs_lancedb_retrievers_and_indices() call), so newly-added
+    techsupport content is invisible to live queries until something calls
+    this. The nightly pipeline calls this after a successful add/replace so
+    new content is queryable immediately, no restart required.
+
+    Cheap and synchronous (just reopens the on-disk LanceDB tables and wraps
+    them in fresh VectorStoreIndex/retriever objects -- no network I/O),
+    unlike update_golden_qa_pairs's background-task GitHub-clone rebuild.
+
+    Args:
+        encrypted_key (str): JWT key for authentication.
+
+    Returns:
+        dict: Success status.
+    """
+    try:
+        jwt.decode(encrypted_key, AUTHENTICATION_KEY, algorithms="HS256")
+        create_qa_pairs_lancedb_retrievers_and_indices(LANCEDB_FOLDERPATH)
+        utils.logger.info("Reloaded QA pairs retrievers/indices (including TECHSUPPORT_QA_PAIRS) on request")
+        return {"success": True, "message": "QA pairs retrievers/indices reloaded"}
+    except jwt.exceptions.InvalidSignatureError as e:
+        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
+    except Exception as exc:
+        utils.logger.critical("Internal error in reload_techsupport_qa_pairs(). Error: %s", exc)
+        raise HTTPException(status_code=500, detail="Internal error in reload_techsupport_qa_pairs()") from exc
+
+
+TECHSUPPORT_THREAD_TAGS_PATH = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "techsupport_thread_tags.json"
+
+
+@app.post("/tag_techsupport_thread/", response_model=str, response_class=PlainTextResponse)
+async def tag_techsupport_thread(thread_ts: str, related_entry_title: str) -> str:
+    """
+    Records that a newly-created techsupport escalation thread is related to an existing
+    verified techsupport entry, so the nightly pipeline can merge new insight into that
+    entry (enrich_verified_entry) instead of adding a duplicate. Read by
+    techsupport_qa_ingest.get_related_entry_title() via nightly_pipeline.py.
+
+    Args:
+        thread_ts (str): Slack ts of the newly-created techsupport channel thread.
+        related_entry_title (str): Title of the existing verified entry this thread relates to.
+
+    Returns:
+        str: "ok" on success.
+
+    Raises:
+        HTTPException: On internal errors.
+    """
+    try:
+        tags = {}
+        if TECHSUPPORT_THREAD_TAGS_PATH.exists():
+            tags = json.loads(TECHSUPPORT_THREAD_TAGS_PATH.read_text(encoding="utf-8"))
+        tags[thread_ts] = related_entry_title
+        TECHSUPPORT_THREAD_TAGS_PATH.write_text(json.dumps(tags, indent=2), encoding="utf-8")
+        return "ok"
+    except Exception as exc:
+        utils.logger.error("Failed to tag techsupport thread %s: %s", thread_ts, exc)
+        raise HTTPException(status_code=500, detail="Failed to tag techsupport thread") from exc
+
+
 @app.post("/record_endorsement/", response_model=str, response_class=PlainTextResponse)
 async def record_endorsement(
     session_id: str, 
@@ -1283,6 +1304,60 @@ async def record_endorsement(
         raise HTTPException(
             status_code=500, detail=f"Internal error in record_endorsement() for session_id: {session_id}"
         ) from exc
+
+@app.get("/get_conversation_history/", response_model=str, response_class=PlainTextResponse)
+async def get_conversation_history(session_id: str) -> str:
+    """
+    Retrieves the full conversation history for a session, formatted as one "Poster: message" line per turn.
+
+    Args:
+        session_id (str): Unique identifier for the session.
+
+    Returns:
+        str: The session's conversation history, e.g. "User: ...\\nAssistant: ...".
+
+    Raises:
+        HTTPException: 404 if the session doesn't exist, 500 on other internal errors.
+    """
+    try:
+        llsc = get_llsc(session_id)
+        return "\n".join(f"{poster}: {message}" for poster, message, _ in llsc.conversation_history)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=f"No existing session found for session_id: {session_id}") from exc
+    except HTTPException as exc:
+        raise exc
+    except Exception as exc:
+        utils.logger.critical("Internal error in get_conversation_history() for session_id: %s. Error: %s", session_id, exc)
+        raise HTTPException(
+            status_code=500, detail=f"Internal error in get_conversation_history() for session_id: {session_id}"
+        ) from exc
+
+
+@app.post("/refine_escalation_query/", response_model=str, response_class=PlainTextResponse)
+async def refine_escalation_query_endpoint(conversation_history: str = Body(..., embed=True)) -> str:
+    """
+    Combines all of a user's messages in a conversation thread into a single, faithful question,
+    for use when escalating the thread to tech support. See refine_escalation_query() for details.
+
+    Args:
+        conversation_history (str): The full conversation history for the thread being escalated.
+
+    Returns:
+        str: The refined, single question text.
+
+    Raises:
+        HTTPException: On internal errors.
+    """
+    try:
+        return refine_escalation_query(conversation_history)
+    except HTTPException as exc:
+        raise exc
+    except Exception as exc:
+        utils.logger.critical("Internal error in refine_escalation_query_endpoint(). Error: %s", exc)
+        raise HTTPException(
+            status_code=500, detail="Internal error in refine_escalation_query_endpoint()"
+        ) from exc
+
 
 @app.post("/get_golden_qa_pairs/")
 async def get_golden_qa_pairs(product: str, encrypted_key: str) -> FileResponse:

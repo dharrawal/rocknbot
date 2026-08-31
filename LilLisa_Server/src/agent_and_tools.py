@@ -35,6 +35,7 @@ IDA_RETRIEVER = None
 IDDM_QA_PAIRS_RETRIEVER = None
 IDA_QA_PAIRS_RETRIEVER = None
 IDO_QA_PAIRS_RETRIEVER = None
+TECHSUPPORT_QA_PAIRS_RETRIEVER = None
 if torch.cuda.is_available():
     _reranker_device = "cuda"
     logging.info("Reranker using GPU (CUDA): %s", torch.cuda.get_device_name(0))
@@ -49,6 +50,15 @@ RERANKER = SentenceTransformerRerank(
 )
 CLIENT = None
 OPENAI_CLIENT = None
+
+# Slack section/context blocks are capped at ~3000 characters, so the "potentially
+# relevant" match displays must stay well under that even when several matches clear
+# the threshold. Cap the number of matches shown and truncate each answer individually.
+# (Used only for golden QA pairs' "potentially relevant" display -- techsupport content
+# is merged into normal document retrieval with no separate display, see
+# answer_from_document_retrieval below.)
+MAX_DISPLAYED_MATCHES = 3
+MATCH_ANSWER_DISPLAY_LENGTH = 500
 
 QA_SYSTEM_PROMPT = None
 QA_USER_PROMPT = None
@@ -170,6 +180,8 @@ IDDM_RETRIEVER = None
 IDA_RETRIEVER = None
 IDDM_QA_PAIRS_RETRIEVER = None
 IDA_QA_PAIRS_RETRIEVER = None
+TECHSUPPORT_QA_PAIRS_INDEX = None
+TECHSUPPORT_QA_PAIRS_RETRIEVER = None
 def create_docdbs_lancedb_retrievers_and_indices(lancedb_folderpath: str) -> None:
     """Create indices and retrievers from lancedb tables, attempting to create indices if they don't exist."""
     global IDDM_RETRIEVER, IDA_RETRIEVER, IDO_RETRIEVER
@@ -198,6 +210,7 @@ def create_qa_pairs_lancedb_retrievers_and_indices(lancedb_folderpath: str) -> N
     """Create indices and retrievers from lancedb tables, attempting to create indices if they don't exist."""
     global IDDM_QA_PAIRS_RETRIEVER, IDA_QA_PAIRS_RETRIEVER, IDO_QA_PAIRS_RETRIEVER
     global IDDM_QA_PAIRS_INDEX, IDA_QA_PAIRS_INDEX, IDO_QA_PAIRS_INDEX
+    global TECHSUPPORT_QA_PAIRS_INDEX, TECHSUPPORT_QA_PAIRS_RETRIEVER
 
     lance_db = lancedb.connect(lancedb_folderpath)
     iddm_qa_pairs_table = lance_db.open_table("IDDM_QA_PAIRS")
@@ -217,6 +230,16 @@ def create_qa_pairs_lancedb_retrievers_and_indices(lancedb_folderpath: str) -> N
         IDO_QA_PAIRS_RETRIEVER = IDO_QA_PAIRS_INDEX.as_retriever(similarity_top_k=8)
     except Exception:
         utils.logger.warning("IDO_QA_PAIRS LanceDB table not found — IDO QA pairs retrieval will be disabled")
+
+    # Shared techsupport QA pairs table (product-agnostic, used by IDA/IDDM/IDO
+    # alike -- see techsupport_qa_ingest.py) — optional, only initialize if it exists
+    try:
+        techsupport_qa_pairs_table = lance_db.open_table("TECHSUPPORT_QA_PAIRS")
+        techsupport_qa_pairs_vector_store = LanceDBVectorStore.from_table(techsupport_qa_pairs_table, "vector")
+        TECHSUPPORT_QA_PAIRS_INDEX = VectorStoreIndex.from_vector_store(vector_store=techsupport_qa_pairs_vector_store)
+        TECHSUPPORT_QA_PAIRS_RETRIEVER = TECHSUPPORT_QA_PAIRS_INDEX.as_retriever(similarity_top_k=8)
+    except Exception:
+        utils.logger.warning("TECHSUPPORT_QA_PAIRS LanceDB table not found — shared techsupport QA pairs retrieval will be disabled")
 
 def create_lancedb_retrievers_and_indices(lancedb_folderpath: str) -> None:
     """Create indices and retrievers from lancedb tables, attempting to create indices if they don't exist."""
@@ -344,6 +367,51 @@ def improve_query(query: str, conversation_history: str) -> str:
     return response
 
 
+def refine_escalation_query(conversation_history: str) -> str:
+    """
+    Combines every message the user sent in a thread into a single, faithful question, for use when
+    escalating a thread to tech support. Unlike improve_query(), this must NOT reinterpret, broaden,
+    narrow, or otherwise change the scope of what the user asked - it only merges what the user actually
+    said (e.g. an initial question plus a follow-up rephrasing or clarification) into one coherent question.
+    * conversation_history is the full conversation history (all User/Assistant turns) for the thread being escalated
+    """
+    user_prompt = f"""
+    ###CONVERSATION HISTORY###
+    {conversation_history}
+
+    Above is a conversation thread that is being escalated to human tech support because the assistant could
+    not answer it. Find every message sent by "User" in that history, and combine them into a single,
+    self-contained question suitable for a tech support agent who has not seen the thread.
+
+    Rules:
+    - Preserve the scope and meaning of the user's messages exactly. Do NOT broaden, narrow, reinterpret, add
+      assumptions, or infer intent beyond what the user actually wrote.
+    - If later user messages rephrase, clarify, or add detail to an earlier question, merge them into one
+      coherent question rather than listing them separately or picking only one.
+    - Do not answer the question. Do not mention the assistant's prior replies except as needed for the
+      combined question to stand on its own.
+    - Output ONLY the final combined question text - no preamble, labels, or explanation.
+    """
+
+    response = ""
+    t0 = time.perf_counter()
+    for chunk in completion(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "user", "content": user_prompt}
+        ],
+        stream=True,  # Enable streaming
+    ):
+        # Process each chunk as it arrives
+        if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
+            content = chunk.choices[0].delta.content
+            response += content
+    elapsed = time.perf_counter() - t0
+    utils.logger.debug("PERF | refine_escalation_query_llm | %.3fs", elapsed)
+
+    return response.strip()
+
+
 def format_tables_in_chunks(chunks: str) -> str:
     """Detect and format tables in retrieved chunks at query time.
 
@@ -409,6 +477,29 @@ def format_tables_in_chunks(chunks: str) -> str:
     return "\n".join(result_lines)
 
 
+def _truncate_match_answer(answer: str, max_length: int = MATCH_ANSWER_DISPLAY_LENGTH) -> str:
+    """Truncate a single QA/techsupport match's answer so no one match can blow out the display.
+
+    A hard slice at max_length can land inside a ``` fenced code block, leaving it unclosed
+    and breaking Slack's mrkdwn rendering. If that happens, cut before the code block instead
+    of mid-block -- simpler and more robust than trying to re-close the fence, since it never
+    risks displaying a syntactically confusing code fragment.
+    """
+    if len(answer) <= max_length:
+        return answer
+    truncated = answer[:max_length]
+    if truncated.count("```") % 2 != 0:
+        fence_index = truncated.rfind("```")
+        before_fence = truncated[:fence_index].rstrip()
+        if before_fence:
+            return before_fence + "..."
+        # The truncation point falls inside the very first code block with no preceding
+        # text -- cutting it out entirely would leave nothing to show, so close the fence
+        # instead of dropping it.
+        return truncated + "\n```..."
+    return truncated + "..."
+
+
 def answer_from_document_retrieval(
     product: str, original_query: str, generated_query: str, conversation_history: str
 ) -> str:
@@ -426,7 +517,7 @@ def answer_from_document_retrieval(
         if IDDM_INDEX is None or IDDM_QA_PAIRS_INDEX is None:
             elapsed = time.perf_counter() - t0_total
             utils.logger.debug("PERF | answer_from_document_retrieval_total | %.3fs", elapsed)
-            return json.dumps({"response": "IDDM indices are not initialized. The server may have encountered an error during startup. Please contact an administrator.", "reranked_nodes": []})
+            return json.dumps({"response": "IDDM indices are not initialized. The server may have encountered an error during startup. Please contact an administrator.", "reranked_nodes": [], "answer_found": True})
         product_versions = IDDM_PRODUCT_VERSIONS
         version_pattern = re.compile(r"v?\d+\.\d+", re.IGNORECASE)
         document_index = IDDM_INDEX
@@ -438,7 +529,7 @@ def answer_from_document_retrieval(
         if IDO_INDEX is None or IDO_QA_PAIRS_INDEX is None:
             elapsed = time.perf_counter() - t0_total
             utils.logger.debug("PERF | answer_from_document_retrieval_total | %.3fs", elapsed)
-            return json.dumps({"response": "IDO product is not configured on this server. Please contact an administrator.", "reranked_nodes": []})
+            return json.dumps({"response": "IDO product is not configured on this server. Please contact an administrator.", "reranked_nodes": [], "answer_found": True})
         product_versions = IDO_PRODUCT_VERSIONS
         version_pattern = re.compile(r"\b(?:dev/)?v?\d+\.\d+\b", re.IGNORECASE)
         document_index = IDO_INDEX
@@ -449,7 +540,7 @@ def answer_from_document_retrieval(
         if IDA_INDEX is None or IDA_QA_PAIRS_INDEX is None:
             elapsed = time.perf_counter() - t0_total
             utils.logger.debug("PERF | answer_from_document_retrieval_total | %.3fs", elapsed)
-            return json.dumps({"response": "IDA indices are not initialized. The server may have encountered an error during startup. Please contact an administrator.", "reranked_nodes": []})
+            return json.dumps({"response": "IDA indices are not initialized. The server may have encountered an error during startup. Please contact an administrator.", "reranked_nodes": [], "answer_found": True})
         product_versions = IDA_PRODUCT_VERSIONS
         version_pattern = re.compile(r"\b(?:IAP[- ]\d+\.\d+|version[- ]\d+\.\d+|descartes(?:-dev)?)\b", re.IGNORECASE)
         document_index = IDA_INDEX
@@ -472,10 +563,17 @@ def answer_from_document_retrieval(
             vector_store_kwargs={"where": lance_filter_qa_pairs}, similarity_top_k=8
         )
     else:
-        qa_system_prompt += "\n10. At the beginning of your response, mention that because a specific product version was not specified, information from all available versions was used."
+        qa_system_prompt += "\n10. Mention that because a specific product version was not specified, information from all available versions was used. If your response begins with the \"[[NO_ANSWER]]\" marker per rule 9, that marker must still come first, before this mention."
         # Create fresh retrievers (not global defaults) so we can set cached embed model
         document_retriever = document_index.as_retriever(similarity_top_k=50)
         qa_pairs_retriever = qa_pairs_index.as_retriever(similarity_top_k=8)
+
+    # Shared techsupport QA pairs table -- product-agnostic, so no version filtering.
+    # Optional: gracefully skip if the table hasn't been created yet (fresh install),
+    # same pattern as the optional IDO retrievers above.
+    techsupport_qa_pairs_retriever = None
+    if TECHSUPPORT_QA_PAIRS_INDEX is not None:
+        techsupport_qa_pairs_retriever = TECHSUPPORT_QA_PAIRS_INDEX.as_retriever(similarity_top_k=8)
 
     # Set up embedding cache to avoid duplicate API calls during parallel retrieval
     cached_embed = CachedQueryEmbedding(Settings.embed_model)
@@ -484,6 +582,8 @@ def answer_from_document_retrieval(
     utils.logger.debug("PERF | pre_compute_embedding | %.3fs", time.perf_counter() - t0_embed)
     document_retriever._embed_model = cached_embed
     qa_pairs_retriever._embed_model = cached_embed
+    if techsupport_qa_pairs_retriever is not None:
+        techsupport_qa_pairs_retriever._embed_model = cached_embed
 
     # Run QA pairs and document retrieval in parallel
     def _retrieve_qa():
@@ -491,6 +591,24 @@ def answer_from_document_retrieval(
         result = qa_pairs_retriever.retrieve(query)
         utils.logger.debug("PERF | retrieve_qa_pairs | %.3fs", time.perf_counter() - t0)
         return result
+
+    def _retrieve_techsupport_qa():
+        if techsupport_qa_pairs_retriever is None:
+            return []
+        t0 = time.perf_counter()
+        try:
+            result = techsupport_qa_pairs_retriever.retrieve(query)
+            utils.logger.debug("PERF | retrieve_techsupport_qa_pairs | %.3fs", time.perf_counter() - t0)
+            return result
+        except Warning:
+            utils.logger.debug("PERF | retrieve_techsupport_qa_pairs | %.3fs", time.perf_counter() - t0)
+            return []
+        except Exception:
+            # Fail closed (no techsupport results) rather than crashing the whole
+            # answer if the shared techsupport table is unavailable or misconfigured.
+            utils.logger.exception("Shared techsupport QA pairs retrieval failed")
+            utils.logger.debug("PERF | retrieve_techsupport_qa_pairs | %.3fs", time.perf_counter() - t0)
+            return []
 
     def _retrieve_docs():
         t0 = time.perf_counter()
@@ -503,17 +621,19 @@ def answer_from_document_retrieval(
             return []
 
     t0_parallel = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         future_qa = executor.submit(_retrieve_qa)
+        future_techsupport_qa = executor.submit(_retrieve_techsupport_qa)
         future_docs = executor.submit(_retrieve_docs)
-        qa_nodes = future_qa.result()
+        qa_nodes = list(future_qa.result())
+        techsupport_qa_nodes = list(future_techsupport_qa.result())
         nodes = future_docs.result()
     utils.logger.debug("PERF | parallel_retrieval_total | %.3fs", time.perf_counter() - t0_parallel)
 
-    if not nodes:
+    if not nodes and not qa_nodes and not techsupport_qa_nodes:
         elapsed = time.perf_counter() - t0_total
         utils.logger.debug("PERF | answer_from_document_retrieval_total | %.3fs", elapsed)
-        return json.dumps({"response": "No relevant documents were found for this query.", "reranked_nodes": []})
+        return json.dumps({"response": "No relevant documents were found for this query.", "reranked_nodes": [], "answer_found": False})
 
     relevant_qa_nodes = []
     potentially_relevant_qa_nodes = []
@@ -524,33 +644,50 @@ def answer_from_document_retrieval(
         elif 0.7 <= node.score < 0.85:
             potentially_relevant_qa_nodes.append(node)
 
-    # if relevant_qa_nodes:
-    #     response += "Here are some relevant QA pairs that have been verified by an expert!\n"
-    #     for idx, node in enumerate(relevant_qa_nodes, start=1):
-    #         response += f"\nMatch {idx}:\nQuestion: {node.text}\nAnswer: {node.metadata['answer']}\n"
-    #     response += "\n\nAfter searching through the documentation database, this was found:\n"
-
-    combined_nodes = nodes + relevant_qa_nodes
+    # Techsupport nodes are merged wholesale into the same pool documentation
+    # nodes go into, with no score threshold -- exactly like `nodes` above. The
+    # reranker's cross-encoder + top-10 slice below does the relevance
+    # filtering, same as for docs; there is no separate techsupport display.
+    combined_nodes = nodes + relevant_qa_nodes + techsupport_qa_nodes
     t0_rerank = time.perf_counter()
     reranked_nodes = RERANKER.postprocess_nodes(nodes=combined_nodes, query_str=query)[:10]
     utils.logger.debug("PERF | reranking | %.3fs", time.perf_counter() - t0_rerank)
+    # Documentation nodes carry webportal_url (plus their own source-repo github_url
+    # and a front-matter title), techsupport nodes carry ONLY github_url (see
+    # techsupport_qa_ingest.py) -- both are just "a link to this chunk's full
+    # source," collected identically and blended into the same list/section below
+    # rather than given separate treatment. Techsupport URLs end in a long
+    # slugified anchor (unlike webportal_url's short page-name path segments), so
+    # their display text uses the title stashed in metadata by
+    # GenerateTechsupportTitle (techsupport_qa_ingest.py) instead of being derived
+    # from the URL -- see the useful_links loop below. The absence of webportal_url
+    # is what identifies a techsupport-only node; doc nodes always have one.
     useful_links = []
+    seen_urls = set()
     for node in reranked_nodes:
-        if url := node.metadata.get("webportal_url"):
-            useful_links.append(url)
-    useful_links = list(dict.fromkeys(useful_links))[:3]  # Take top 3 WebPortal URLs
+        webportal_url = node.metadata.get("webportal_url")
+        github_url = node.metadata.get("github_url")
+        if url := webportal_url or github_url:
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            is_techsupport_link = webportal_url is None and github_url is not None
+            title = node.metadata.get("title") if is_techsupport_link else None
+            useful_links.append((url, title))
+    useful_links = useful_links[:3]  # Take top 3 links
 
     chunks = []
     for node in reranked_nodes:
-        # Check if this is a QA node
+        # Golden QA pairs carry an 'answer' metadata field; techsupport nodes
+        # (now prose summaries, see techsupport_qa_ingest.py) and documentation
+        # nodes don't, so both fall into the plain node.text branch below.
         if 'answer' in node.metadata:
-            # Format as a QA pair with clear prefix
             answer = node.metadata.get('answer', 'No answer found')
             chunks.append(f"EXPERT VERIFIED ANSWER: {answer}")
         else:
-            # Regular document node
+            # Regular document node (or a techsupport prose summary)
             chunks.append(node.text)
-    
+
     raw_chunks = "\n\n".join(chunks)
     t0_format = time.perf_counter()
     formatted_chunks = format_tables_in_chunks(raw_chunks)
@@ -560,45 +697,126 @@ def answer_from_document_retrieval(
     user_prompt = user_prompt.replace("<CONVERSATION_HISTORY>", conversation_history)
     user_prompt = user_prompt.replace("<QUESTION>", original_query)
 
+    llm_messages = [
+        {"role": "system", "content": qa_system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
     t0_llm = time.perf_counter()
     llm_response = completion(
         model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": qa_system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
+        messages=llm_messages,
+        temperature=0.0,
     ).choices[0].message.content
     utils.logger.debug("PERF | answer_generation_llm | %.3fs", time.perf_counter() - t0_llm)
 
-    response += llm_response
+    no_answer_marker = "[[NO_ANSWER]]"
+    utils.logger.info("DEBUG_NO_ANSWER | raw llm_response before stripping: %r", llm_response)
 
-    # Format links as plain markdown links to avoid double HTML conversion
-    response += "\n\nHere are some potentially helpful documentation links:"
-    for link in useful_links:
-        # Extract the last part of the URL to use as link text
-        path_parts = link.split('/')
-        filename = path_parts[-1]
-        response += f"\n- [{filename}]({link})"
+    # Mistral's hosted inference layer has been observed to non-deterministically emit
+    # [[NO_ANSWER]] on identical input even at temperature=0 (confirmed: the same prompt
+    # and context produced a correct answer in some runs and [[NO_ANSWER]] in others).
+    # When the reranker was highly confident in the top match, a NO_ANSWER is more likely
+    # a serving-layer fluke than a genuine "not in context" -- retry the identical call
+    # once before giving up. Threshold is well below the 6.0069 top-score seen in a
+    # confirmed-good case, with margin, since cross-encoder scores for genuinely
+    # off-topic top matches were observed well under 1.
+    NO_ANSWER_RETRY_SCORE_THRESHOLD = 3.0
+    if (
+        llm_response.find(no_answer_marker) != -1
+        and reranked_nodes
+        and reranked_nodes[0].score > NO_ANSWER_RETRY_SCORE_THRESHOLD
+    ):
+        utils.logger.info(
+            "NO_ANSWER_RETRY | retrying | top_reranked_score=%.4f (threshold=%.1f)",
+            reranked_nodes[0].score, NO_ANSWER_RETRY_SCORE_THRESHOLD,
+        )
+        t0_retry = time.perf_counter()
+        retry_response = completion(
+            model=LLM_MODEL,
+            messages=llm_messages,
+            temperature=0.0,
+        ).choices[0].message.content
+        utils.logger.debug("PERF | answer_generation_llm_retry | %.3fs", time.perf_counter() - t0_retry)
+        retry_changed_outcome = retry_response.find(no_answer_marker) == -1
+        utils.logger.info(
+            "NO_ANSWER_RETRY | retry complete | changed_outcome=%s | retry_response: %r",
+            retry_changed_outcome, retry_response,
+        )
+        llm_response = retry_response
+
+    marker_index = llm_response.find(no_answer_marker)
+    if marker_index != -1:
+        answer_found = False
+        llm_response = llm_response[marker_index + len(no_answer_marker):].lstrip()
+    else:
+        answer_found = True
+    utils.logger.info(
+        "DEBUG_NO_ANSWER | marker_stripped=%s answer_found=%s final llm_response: %r",
+        not answer_found,
+        answer_found,
+        llm_response,
+    )
+
+    response += llm_response
 
     if potentially_relevant_qa_nodes and not relevant_qa_nodes:
         response += "\n\n\n"
         response += "In addition, here are some potentially relevant QA pairs that have been verified by an expert!\n"
-        for idx, node in enumerate(potentially_relevant_qa_nodes, start=1):
-            response += f"\nMatch {idx}:\nQuestion: {node.text}\nAnswer: {node.metadata['answer']}\n"
+        displayed_qa_nodes = sorted(potentially_relevant_qa_nodes, key=lambda n: n.score, reverse=True)[:MAX_DISPLAYED_MATCHES]
+        for idx, node in enumerate(displayed_qa_nodes, start=1):
+            answer = _truncate_match_answer(node.metadata['answer'])
+            response += f"\nMatch {idx}:\nQuestion: {node.text}\nAnswer: {answer}\n"
+
+    # Kept out of `response` and returned as its own field so slack.py can place the links
+    # block after the techsupport/QA match sections instead of immediately after the answer.
+    links_text = ""
+    if useful_links:
+        # Slack's mrkdwn -- what this text is rendered as, see slack.py -- uses
+        # <url|text> for links, not standard Markdown's [text](url). The latter
+        # renders as literal bracketed text with the raw URL auto-linkified
+        # separately next to it.
+        links_text = "Here are some potentially helpful documentation links:"
+        for link, title in useful_links:
+            if title:
+                link_text = title
+            else:
+                # Extract the last part of the URL to use as link text
+                path_parts = link.split('/')
+                link_text = path_parts[-1]
+            links_text += f"\n- <{link}|{link_text}>"
 
     nodes_info = []
     for node in reranked_nodes:
         if 'answer' in node.metadata:
-            # For QA nodes, include both question and answer in the text field
+            # Golden QA pair -- include both question and answer in the text field
             nodes_info.append({
                 "text": f"EXPERT VERIFIED QA PAIR:\nQuestion: {node.text}\nAnswer: {node.metadata['answer']}",
                 "metadata": node.metadata
             })
         else:
-            # Regular document node
+            # Regular document node (or a techsupport prose summary)
             nodes_info.append({"text": node.text, "metadata": node.metadata})
-    
-    response_dict = {"response": response, "reranked_nodes": nodes_info}
+
+    # If the #1 reranked match is itself a techsupport entry (same detection as the
+    # useful_links loop above), tag its title so the escalation flow can later merge
+    # new insight into that entry instead of creating a duplicate -- see slack.py's
+    # build_escalation_button_value and nightly_pipeline.py's enrich_verified_entry.
+    primary_techsupport_match_title = None
+    if reranked_nodes:
+        top_node = reranked_nodes[0]
+        top_webportal_url = top_node.metadata.get("webportal_url")
+        top_github_url = top_node.metadata.get("github_url")
+        if top_webportal_url is None and top_github_url is not None:
+            primary_techsupport_match_title = top_node.metadata.get("title")
+
+    response_dict = {
+        "response": response,
+        "links_text": links_text,
+        "reranked_nodes": nodes_info,
+        "answer_found": answer_found,
+        "primary_techsupport_match_title": primary_techsupport_match_title,
+    }
     elapsed = time.perf_counter() - t0_total
     utils.logger.debug("PERF | answer_from_document_retrieval_total | %.3fs", elapsed)
     return json.dumps(response_dict)
