@@ -106,6 +106,7 @@ PROJECT_ROOT = LILLISA_SERVER_ROOT
 
 from github_sync import push_verified_qa_pairs  # noqa: E402
 from nightly_techsupport_sync import load_env, load_state, paginate_messages, save_state, sync  # noqa: E402
+from pipeline_summary import format_pipeline_counts  # noqa: E402
 from techsupport_classifier import classify_thread  # noqa: E402
 from techsupport_contextual_reembed import run_if_due as run_reembed_if_due  # noqa: E402
 from techsupport_qa_ingest import (  # noqa: E402
@@ -430,20 +431,14 @@ def run_pipeline() -> Dict[str, Any]:
         "techsupport_index_reload_after_reembed": reload_after_reembed_result,
     }
 
-    logger.info(
-        "Pipeline summary: checked=%d added=%d replaced=%d left_as_is_not_useful=%d "
-        "left_as_is_not_conclusive=%d skipped_not_useful=%d skipped_not_conclusive=%d errored=%d",
-        counts["checked"], counts["added"], counts["replaced"], counts["left_as_is_not_useful"],
-        counts["left_as_is_not_conclusive"], counts["skipped_not_useful"], counts["skipped_not_conclusive"],
-        counts["errored"],
-    )
+    logger.info("Pipeline summary: %s", format_pipeline_counts(counts))
 
     if errors:
         error_lines = "\n".join(f"- {e['thread_ts']}: {e['error']}" for e in errors)
+        # `checked` is already in the sentence; omit it from the parenthetical.
         alert_text = (
             f"nightly_pipeline.py: {counts['errored']} thread(s) errored out of {counts['checked']} checked "
-            f"(added={counts['added']}, replaced={counts['replaced']}, skipped_not_useful={counts['skipped_not_useful']}, "
-            f"skipped_not_conclusive={counts['skipped_not_conclusive']}).\n{error_lines}"
+            f"({format_pipeline_counts(counts, omit=('checked',))}).\n{error_lines}"
         )
         post_admin_alert(token, admin_channel_id, alert_text)
 

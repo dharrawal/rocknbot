@@ -310,10 +310,13 @@ No `raise_for_status()`. Failed tags look successful; nightly ingest will create
 - **Done:** Slack `tag_techsupport_thread` calls `raise_for_status()`. HTTP failures log status and a truncated body and are still swallowed so escalate UX is unchanged.
 - **Beads:** `pr42-mp.4.2` **closed**. Parent RELIABILITY epic `pr42-mp.4` **closed**.
 
-### INSTRUMENTATION (`pr42-mp.5`)
+### INSTRUMENTATION (`pr42-mp.5`) — **closed** (1/1 children closed)
 
 `**enriched` omitted from the summary log line** (`pr42-mp.5.1`)  
 `counts` tracks `enriched` (and GitHub push / reload use it). The `logger.info` pipeline summary and the admin-alert string include `replaced` but not `enriched`. An enrich-only night looks like `added=0 replaced=0`.
+
+- **Done:** `format_pipeline_counts()` in `lil-lisa-cron-scripts/pipeline_summary.py` renders all counts (`enriched` after `added`). Shared by the INFO summary and the admin-alert parenthetical in `nightly_pipeline.py`. Unknown keys are appended sorted. Tests: `lil-lisa-cron-scripts/tests/test_format_pipeline_counts.py`.
+- **Beads:** `pr42-mp.5.1` **closed**. Parent INSTRUMENTATION epic `pr42-mp.5` **closed**.
 
 ### MISC (`pr42-mp.6`)
 
