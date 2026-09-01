@@ -682,7 +682,14 @@ async def invoke_stream_with_nodes(
     Raises:
         HTTPException: On internal errors or invalid input.
     """
-    utils.logger.info("session_id: %s, locale: %s, product: %s, nl_query: %s", session_id, locale, product, nl_query)
+    utils.logger.info(
+        "invoke_stream session_id=%s locale=%s product=%s query_chars=%s",
+        session_id, locale, product, len(nl_query or ""),
+    )
+    utils.logger.debug(
+        "session_id: %s, locale: %s, product: %s, nl_query: %s",
+        session_id, locale, product, nl_query,
+    )
     
     # Validate and auto-correct embedding model compatibility
     validate_embedding_compatibility()
@@ -808,6 +815,32 @@ async def invoke_stream_with_nodes(
 
     return StreamingResponse(streamer(), media_type="text/html", headers=custom_headers)
 
+def _log_invoke_heartbeat(
+    *,
+    session_id: str,
+    locale: str,
+    product: str,
+    is_followup: bool,
+    query_chars: int,
+    elapsed_ms: float,
+    outcome: str,
+    answer_found: Optional[bool] = None,
+) -> None:
+    """INFO line so ops can confirm Slack hit /invoke/ without logging the query text."""
+    utils.logger.info(
+        "invoke session_id=%s locale=%s product=%s followup=%s query_chars=%s "
+        "answer_found=%s elapsed_ms=%.0f outcome=%s",
+        session_id,
+        locale,
+        product,
+        is_followup,
+        query_chars,
+        answer_found,
+        elapsed_ms,
+        outcome,
+    )
+
+
 @app.post("/invoke/", response_model=dict, response_class=JSONResponse)
 def invoke(
     session_id: str,
@@ -834,9 +867,14 @@ def invoke(
         HTTPException: On internal errors or invalid input.
     """
     nodes = []
+    t0_invoke = time.perf_counter()
+    query_chars = len(nl_query or "")
     try:
-        utils.logger.info("session_id: %s, locale: %s, product: %s, nl_query: %s, Follow_up: %s", session_id, locale, product, nl_query, is_followup)
-        
+        utils.logger.debug(
+            "session_id: %s, locale: %s, product: %s, nl_query: %s, Follow_up: %s",
+            session_id, locale, product, nl_query, is_followup,
+        )
+
         # Validate and auto-correct embedding model compatibility
         validate_embedding_compatibility()
         
@@ -847,6 +885,15 @@ def invoke(
             try:
                 keyvalue_db = Rdict(db_folderpath)
                 if session_id not in keyvalue_db:
+                    _log_invoke_heartbeat(
+                        session_id=session_id,
+                        locale=locale,
+                        product=product,
+                        is_followup=is_followup,
+                        query_chars=query_chars,
+                        elapsed_ms=(time.perf_counter() - t0_invoke) * 1000,
+                        outcome="session_expired",
+                    )
                     return JSONResponse(content={
                         "response": "This session is expired, start a new conversation.",
                         "reranked_nodes": [],
@@ -865,6 +912,15 @@ def invoke(
         # Handle expert answering case
         if is_expert_answering:
             llsc.add_to_conversation_history("Expert", nl_query, query_id)
+            _log_invoke_heartbeat(
+                session_id=session_id,
+                locale=locale,
+                product=product,
+                is_followup=is_followup,
+                query_chars=query_chars,
+                elapsed_ms=(time.perf_counter() - t0_invoke) * 1000,
+                outcome="expert_passthrough",
+            )
             return JSONResponse(content={
                 "response": nl_query,
                 "reranked_nodes": [],
@@ -936,6 +992,16 @@ def invoke(
             llsc.save_context()
             utils.logger.debug("PERF | save_context | %.3fs", time.perf_counter() - t0_save)
 
+        _log_invoke_heartbeat(
+            session_id=session_id,
+            locale=locale,
+            product=product,
+            is_followup=is_followup,
+            query_chars=query_chars,
+            elapsed_ms=(time.perf_counter() - t0_invoke) * 1000,
+            outcome="ok",
+            answer_found=answer_found,
+        )
         # Return JSON response
         return JSONResponse(content={
             "response": response_text,
@@ -951,7 +1017,19 @@ def invoke(
     except HTTPException as exc:
         raise exc
     except Exception as exc:
-        utils.logger.critical("Internal error in invoke() for session_id: %s, nl_query: %s. Error: %s", session_id, nl_query, exc)
+        _log_invoke_heartbeat(
+            session_id=session_id,
+            locale=locale,
+            product=product,
+            is_followup=is_followup,
+            query_chars=query_chars,
+            elapsed_ms=(time.perf_counter() - t0_invoke) * 1000,
+            outcome="error",
+        )
+        utils.logger.critical(
+            "Internal error in invoke() for session_id: %s, query_chars: %s. Error: %s",
+            session_id, query_chars, exc,
+        )
         raise HTTPException(status_code=500, detail=f"Internal error in invoke() for session_id: {session_id}") from exc
 
 @app.post("/add_expert_qa_pair/", response_model=dict, response_class=JSONResponse)

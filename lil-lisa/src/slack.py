@@ -8,6 +8,7 @@ Slack
 
 import asyncio
 import os
+import time
 import jwt
 
 from typing import Dict, List, Any
@@ -459,6 +460,7 @@ async def get_ans(query, thread_id, msg_id, product, is_expert_answering):
     """Get the answer from the chain"""
     conv_id = None
     conv_id = thread_id or msg_id
+    t0 = time.perf_counter()
     try:
         # Call the invoke API
         full_url = f"{BASE_URL}/invoke/"
@@ -474,17 +476,32 @@ async def get_ans(query, thread_id, msg_id, product, is_expert_answering):
 
             },
             timeout=90,  # Increased timeout to 90
-        )    
+        )
     except (requests.exceptions.ReadTimeout, requests.exceptions.Timeout) as timeout_exc:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "[GET_ANS] conv_id=%s http_status=timeout bytes=0 elapsed_ms=%.0f",
+            conv_id, elapsed_ms,
+        )
         logger.error(f"Request timed out: {timeout_exc}")
         return "The agent failed to generate an answer. Please try again in a new message thread. Frame clear queries using full sentence(s)"
     except Exception as exc:  # pylint: disable=broad-except
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "[GET_ANS] conv_id=%s http_status=error bytes=0 elapsed_ms=%.0f",
+            conv_id, elapsed_ms,
+        )
         logger.error(f"An error occurred during the asynchronous call get_ans: {exc}")
         return f"Lil lisa Slack-An error occured: {exc}"
 
-    conv_dict = {"conv_id": conv_id, "post": response.text, "poster": "Lil-Lisa"}
-    logger.info(str(conv_dict))
-    return response.text
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    body = response.text
+    logger.info(
+        "[GET_ANS] conv_id=%s http_status=%s bytes=%s elapsed_ms=%.0f",
+        conv_id, response.status_code, len(body), elapsed_ms,
+    )
+    logger.debug("[GET_ANS BODY] conv_id=%s post=%s poster=Lil-Lisa", conv_id, body)
+    return body
 
 
 async def add_expert_verified_qa_pair(item_ts, channel_id, expert_user_id):
@@ -808,7 +825,10 @@ async def process_msg(event, say):
     )
     logger.info(
         f"[ESCALATE BUTTON CREATE] conv_id={conv_id!r} thread_ts(event)={thread_ts!r} "
-        f"message_ts={message_ts!r} orig_thread_ts={orig_thread_ts!r} query={text[:ESCALATE_VALUE_QUERY_MAX_LENGTH]!r}"
+        f"message_ts={message_ts!r} orig_thread_ts={orig_thread_ts!r} query_chars={len(text)}"
+    )
+    logger.debug(
+        f"[ESCALATE BUTTON CREATE] conv_id={conv_id!r} query={text[:ESCALATE_VALUE_QUERY_MAX_LENGTH]!r}"
     )
 
     techsupport_ready = bool(get_techsupport_channel(product))
@@ -913,6 +933,10 @@ async def handle_escalate_to_techsupport(ack, body, client):
     related_entry_title = payload.get("primary_techsupport_match_title")
 
     logger.info(
+        f"[ESCALATE CLICK] session_id={session_id!r} query_chars={len(query)} "
+        f"thread_ts={orig_thread_ts!r} channel_id={orig_channel_id!r}"
+    )
+    logger.debug(
         f"[ESCALATE CLICK] payload={payload!r} session_id={session_id!r} query={query!r}"
     )
 
@@ -948,6 +972,10 @@ async def handle_escalate_to_techsupport(ack, body, client):
         try:
             conversation_history = await fetch_conversation_history(session_id)
             logger.info(
+                f"[ESCALATE HISTORY] session_id={session_id!r} "
+                f"history_chars={len(conversation_history)}"
+            )
+            logger.debug(
                 f"[ESCALATE HISTORY] session_id={session_id!r} conversation_history={conversation_history!r}"
             )
             user_message_count = sum(
@@ -958,6 +986,10 @@ async def handle_escalate_to_techsupport(ack, body, client):
             if user_message_count > 1:
                 refined_query = await get_refined_escalation_query(conversation_history)
                 logger.info(
+                    f"[ESCALATE REFINE] session_id={session_id!r} called=True "
+                    f"refined_chars={len(refined_query)}"
+                )
+                logger.debug(
                     f"[ESCALATE REFINE] session_id={session_id!r} called=True refined_query={refined_query!r}"
                 )
                 if refined_query.strip():
@@ -975,6 +1007,10 @@ async def handle_escalate_to_techsupport(ack, body, client):
             escalation_query_source = f"raw button query (refinement error: {exc})"
 
     logger.info(
+        f"[ESCALATE FINAL] session_id={session_id!r} query_chars={len(escalation_query)} "
+        f"source={escalation_query_source!r}"
+    )
+    logger.debug(
         f"[ESCALATE FINAL] session_id={session_id!r} escalation_query={escalation_query!r} "
         f"source={escalation_query_source!r}"
     )

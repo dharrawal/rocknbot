@@ -10,17 +10,16 @@ describes).
 Clones the repo fresh into a temp directory on every call rather than keeping
 a persistent local clone -- same clone-fresh-every-time pattern src/main.py
 already uses for the golden QA pairs repo (QA_PAIRS_GITHUB_REPO_URL) -- so
-there's no local git state that can drift or get corrupted between runs, and
-the temp dir (which briefly holds the authenticated URL in its
-.git/config) is deleted immediately after use.
+there's no local git state that can drift or get corrupted between runs.
+Credentials are passed via GIT_ASKPASS (never embedded in the clone URL or
+written into .git/config). The work dir is deleted immediately after use.
 
 Required env vars (read from scripts/env/github_push.env):
     GITHUB_TOKEN     - a GitHub personal access token with push access to
                         GITHUB_REPO_URL's repo
     GITHUB_REPO_URL  - HTTPS URL of the destination repo, e.g.
                         https://github.com/<org>/<repo>.git (no embedded
-                        credentials -- the token is injected into the clone
-                        URL in-memory for this call only)
+                        credentials)
 
 Usage (as a library, e.g. from nightly_pipeline.py):
     from github_sync import push_verified_qa_pairs
@@ -38,7 +37,7 @@ import tempfile
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import git
 from dotenv import dotenv_values
@@ -79,15 +78,40 @@ def load_env() -> Dict[str, str]:
     return env
 
 
-def _authenticated_url(repo_url: str, token: str) -> str:
-    """Injects the token into the repo URL for this clone only. Must be
-    https:// -- a token can't be used as a password over the git:// or ssh
-    schemes GitHub also serves."""
+def _require_https_repo_url(repo_url: str) -> str:
+    """GIT_ASKPASS only works for HTTPS. Reject git:// and ssh:// so we never
+    silently fall back to a scheme that can't use GITHUB_TOKEN."""
     parts = urlsplit(repo_url)
     if parts.scheme != "https":
         raise ValueError(f"GITHUB_REPO_URL must be an https:// URL, got: {repo_url}")
-    netloc = f"{token}@{parts.netloc}"
-    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    if parts.username or parts.password:
+        raise ValueError(
+            "GITHUB_REPO_URL must not include credentials; set GITHUB_TOKEN instead"
+        )
+    return repo_url
+
+
+def _write_git_askpass(directory: Path) -> Path:
+    """Helper Git will exec for Username/Password prompts. Always prints
+    $GITHUB_TOKEN (GitHub accepts the PAT as either field). The token is not
+    written into this file."""
+    path = Path(directory) / "git-askpass.sh"
+    path.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$GITHUB_TOKEN\"\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
+    return path
+
+
+def _git_auth_env(token: str, askpass_path: Path) -> dict:
+    env = os.environ.copy()
+    env["GIT_ASKPASS"] = str(askpass_path)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
+    env["GITHUB_TOKEN"] = token
+    return env
 
 
 def push_verified_qa_pairs() -> Dict[str, Any]:
@@ -104,13 +128,25 @@ def push_verified_qa_pairs() -> Dict[str, Any]:
         logger.info("No %s found at %s -- nothing to push", TECHSUPPORT_QA_MARKDOWN_FILENAME, source_path)
         return {"pushed": False, "reason": "source_missing"}
 
-    temp_dir = tempfile.mkdtemp(prefix="techsupport_github_sync_")
-    try:
-        authenticated_url = _authenticated_url(repo_url, token)
-        logger.info("Cloning %s into %s", repo_url, temp_dir)
-        repo = git.Repo.clone_from(authenticated_url, temp_dir)
+    repo_url = _require_https_repo_url(repo_url)
 
-        dest_path = Path(temp_dir) / TECHSUPPORT_QA_MARKDOWN_FILENAME
+    work_dir = tempfile.mkdtemp(prefix="techsupport_github_sync_")
+    try:
+        # Askpass lives next to the clone, not inside it — git clone requires an
+        # empty destination directory.
+        askpass_path = _write_git_askpass(Path(work_dir))
+        git_env = _git_auth_env(token, askpass_path)
+        clone_dir = os.path.join(work_dir, "repo")
+        logger.info("Cloning %s into %s", repo_url, clone_dir)
+        repo = git.Repo.clone_from(
+            repo_url,
+            clone_dir,
+            env=git_env,
+            # Do not let a global credential.helper persist the PAT to disk.
+            multi_options=["--config", "credential.helper="],
+        )
+
+        dest_path = Path(clone_dir) / TECHSUPPORT_QA_MARKDOWN_FILENAME
         if dest_path.exists() and filecmp.cmp(source_path, dest_path, shallow=False):
             logger.info("%s unchanged -- skipping commit/push", TECHSUPPORT_QA_MARKDOWN_FILENAME)
             return {"pushed": False, "reason": "unchanged"}
@@ -120,12 +156,13 @@ def push_verified_qa_pairs() -> Dict[str, Any]:
 
         commit_message = f"Update verified techsupport QA pairs - {date.today().isoformat()}"
         repo.index.commit(commit_message, author=COMMIT_AUTHOR, committer=COMMIT_AUTHOR)
-        repo.remote(name="origin").push()
+        with repo.git.custom_environment(**git_env):
+            repo.remote(name="origin").push()
 
         logger.info("Pushed commit: %s", commit_message)
         return {"pushed": True, "commit_message": commit_message}
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

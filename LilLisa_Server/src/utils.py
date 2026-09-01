@@ -69,13 +69,12 @@ def build_no_answer_retry_log_record(
     first_answer_found: bool,
     retry_answer_found: bool,
 ) -> dict:
-    """Fields needed later to judge whether the served try-2 is grounded in the top chunk.
+    """Full retry payload for DEBUG (`NO_ANSWER_RETRY_DETAIL`).
 
-    Extract `event=NO_ANSWER_RETRY` lines from server logs. `changed_outcome`
-    is true when try-1 was no-answer and try-2 is not -- those are the cases
-    where the retry turned an "I don't know" into an answer the user received.
-    The queries, both raw completions, top score, and top chunk (text + source
-    metadata) are enough to score try-2 relevance without a second retrieval.
+    Queries, both raw completions, and the top chunk are PII-ish — do not log
+    this dict at INFO. `changed_outcome` is true when try-1 was no-answer and
+    try-2 is not. pr42-enhancements.2 should extract DEBUG detail lines (or
+    enable DEBUG for a measurement window).
     """
     return {
         "event": "NO_ANSWER_RETRY",
@@ -91,6 +90,21 @@ def build_no_answer_retry_log_record(
         "first_answer_found": first_answer_found,
         "retry_answer_found": retry_answer_found,
         "changed_outcome": (not first_answer_found) and retry_answer_found,
+    }
+
+
+def build_no_answer_retry_info_record(detail: dict) -> dict:
+    """INFO subset: enough for ops to see a retry ran, no question/answer text."""
+    return {
+        "event": "NO_ANSWER_RETRY",
+        "product": detail["product"],
+        "top_rerank_score": detail["top_rerank_score"],
+        "threshold": detail["threshold"],
+        "first_answer_found": detail["first_answer_found"],
+        "retry_answer_found": detail["retry_answer_found"],
+        "changed_outcome": detail["changed_outcome"],
+        "query_chars": len(detail.get("original_query") or ""),
+        "retry_chars": len(detail.get("retry_response") or ""),
     }
 
 

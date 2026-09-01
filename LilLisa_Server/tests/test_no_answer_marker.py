@@ -14,6 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.utils import (  # noqa: E402
     NO_ANSWER_MARKER,
+    build_no_answer_retry_info_record,
     build_no_answer_retry_log_record,
     parse_leading_no_answer_marker,
 )
@@ -100,6 +101,13 @@ class NoAnswerRetryLogRecordTests(unittest.TestCase):
         self.assertIn("first_response", record)
         self.assertIn("retry_response", record)
         self.assertIn("top_rerank_score", record)
+        info = build_no_answer_retry_info_record(record)
+        self.assertTrue(info["changed_outcome"])
+        self.assertEqual(info["query_chars"], len("how do I bind?"))
+        self.assertNotIn("original_query", info)
+        self.assertNotIn("retry_response", info)
+        self.assertNotIn("top_chunk_text", info)
+        self.assertNotIn("first_response", info)
 
     def test_unchanged_when_retry_still_no_answer(self):
         record = self._record(

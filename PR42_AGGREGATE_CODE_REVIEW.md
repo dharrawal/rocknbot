@@ -142,13 +142,19 @@ Live Slack + live LanceDB eyeball scripts, with a hardcoded production-ish `DEFA
 - **Done:** Live scripts moved to `LilLisa_Server/smoke/` (dropped `test_` prefix so pytest won’t collect them): `smoke/techsupport_qa_ingest.py`, `smoke/techsupport_classifier.py`. Existing unit tests moved to `LilLisa_Server/tests/` and `lil-lisa/tests/`. No new tests added (no parse_summary_markdown / slugger / state-transition coverage in this pass). No `lil-lisa-web` smoke/tests folders (nothing to move).
 - **Beads:** `pr42-hp.1.4` **closed**. Parent FEATURE epic `pr42-hp.1` **closed**.
 
-### SECURITY (`pr42-hp.2`)
+### SECURITY (`pr42-hp.2`) — **closed** (2/2 children closed)
 
 **GitHub token in clone URL** (`pr42-hp.2.1`)  
 `_authenticated_url` puts the PAT in `https://{token}@github.com/...`, which Git writes into `.git/config` in the temp clone. `rmtree` in `finally` helps; a crash or `git` error log can still leak the token. Prefer `GIT_ASKPASS` / `x-access-token` header, and never log the authenticated URL.
 
+- **Done:** Clone/push use the plain `GITHUB_REPO_URL` plus `GIT_ASKPASS` (helper prints `$GITHUB_TOKEN`; token is not in the URL or `.git/config`). `credential.helper=` for that clone so a global helper cannot persist the PAT. Same `github_push.env` vars. Tests: `LilLisa_Server/tests/test_github_sync.py`.
+- **Beads:** `pr42-hp.2.1` **closed**.
+
 **Full Q&A still logged at INFO (privacy)** (`pr42-hp.2.2`)  
 Customer/employee questions and model output land in production logs. `DEBUG_NO_ANSWER` sites are DEBUG in the final tree, but these INFO dumps remain: retry `retry_response: %r`, `logger.info(str(conv_dict))` in `get_ans`, `[ESCALATE CLICK]` query, `[ESCALATE HISTORY]` conversation_history, `[ESCALATE REFINE]` / `[ESCALATE FINAL]` queries. Default to DEBUG; never log full answers at INFO. Retry metadata (`changed_outcome`, top score) can stay INFO.
+
+- **Done:** Full query/history/answer/refine/retry JSON moved to DEBUG (not dropped). INFO heartbeats: Slack `[GET_ANS] conv_id=… http_status=… bytes=… elapsed_ms=…`; server `invoke session_id=… product=… query_chars=… answer_found=… elapsed_ms=… outcome=…`; escalate lines keep ids/counts/char lengths. `NO_ANSWER_RETRY` INFO is metadata only; full payload is `NO_ANSWER_RETRY_DETAIL` at DEBUG.
+- **Beads:** `pr42-hp.2.2` **closed**. Parent SECURITY epic `pr42-hp.2` **closed**.
 
 ### PERFORMANCE (`pr42-hp.3`)
 

@@ -1,0 +1,162 @@
+# Deployment Documentation: Tech Support Integration
+
+## 1\. Overview
+
+This adds two things to Rocknbot. First, a real-time escalation flow that lets Lil Lisa post unanswered questions to a tech support channel with one click. Second, a nightly pipeline that automatically turns resolved tech support conversations into verified answers the bots can use going forward, including merging new insight into an existing answer instead of always creating a duplicate. Nothing here requires a new service. It's an extension of `LilLisa_Server` and `lil-lisa`, plus a set of standalone scripts triggered on a schedule.
+
+## 2\. New Environment Variables
+
+### `LilLisa_Server/env/lillisa_server.env`
+
+| Variable | Default | Purpose |
+| :---- | :---- | :---- |
+| `TECHSUPPORT_SYNC_INTERVAL_HOURS` | `24` | How often the nightly pipeline checks the tech support channel for new or updated threads. Expert-adjustable. |
+| `TECHSUPPORT_SYNC_HOT_DAYS` | `30` | Nightly, `nightly_techsupport_sync.py` only refreshes known threads whose last reply activity is within this many days. Uses a cheap parent `latest_reply` lookup (`conversations.history`, not a full `conversations.replies` download). |
+| `TECHSUPPORT_SYNC_CATCHUP_AGE_DAYS` | `90` | Age cap for the periodic catch-up: known threads quieter than the hot window but still within this many days are checked on catch-up runs. Threads older than this stay in state but are not polled. |
+| `TECHSUPPORT_SYNC_CATCHUP_INTERVAL_DAYS` | `7` | How often the catch-up pass runs (stamped in `techsupport_sync_state.json` as `last_catchup_timestamp`). Independent of `TECHSUPPORT_SYNC_INTERVAL_HOURS`. |
+| `TECHSUPPORT_SYNC_MAX_PARENT_LOOKUPS` | `200` | Cap on each of the nightly hot set and the catch-up set (hottest first). Excess waits for a later run. |
+| `TECHSUPPORT_REEMBED_INTERVAL_DAYS` | `7` | How often the verified techsupport table gets a full contextual re-embed (late-chunking refresh). Expert-adjustable. |
+| `VERIFIED_TECHSUPPORT_QA_FOLDERPATH` | `data/verified_techsupport/` | Where the verified techsupport markdown file lives locally, before it gets pushed to the GitHub repo (see Section 7). |
+
+### `LilLisa_Server/scripts/env/techsupport_sync.env` (dedicated file)
+
+| Variable | Purpose |
+| :---- | :---- |
+| `SLACK_BOT_TOKEN` | Bot token used by the standalone nightly scripts to read the tech support channel. Same bot as `lil-lisa`'s. |
+| `TECHSUPPORT_CHANNEL_ID` | The real tech support channel ID. |
+| `ADMIN_CHANNEL_ID` | Where pipeline error notifications get posted. |
+
+This is a separate env file from `lil-lisa`'s on purpose, so the nightly scripts can run standalone (for example as their own cron job) without depending on `lil-lisa`'s directory or config existing.
+
+### `LilLisa_Server/scripts/env/github_push.env` (dedicated file, new)
+
+| Variable | Purpose |
+| :---- | :---- |
+| `GITHUB_TOKEN` | Personal access token used to push the verified techsupport markdown file to its dedicated GitHub repo after every nightly update. See Section 7a for PAT scopes and how auth is passed (GIT_ASKPASS; token must not be in the URL). |
+| `GITHUB_REPO_URL` | HTTPS URL of that repo with **no** embedded credentials (currently `sgodey8/rocknbot_techsupport_qa_pairs`, see Section 7). |
+
+### `lil-lisa/app_envfiles/lil-lisa.env` (additions to the existing file)
+
+| Variable | Purpose |
+| :---- | :---- |
+| `TECHSUPPORT_CHANNEL_ID_IDA` | Tech support channel for IDA. |
+| `TECHSUPPORT_CHANNEL_ID_IDDM` | Tech support channel for IDDM. In production these should both point to the same real channel, since there's only one shared tech support channel, not one per product (confirmed during this project). |
+
+**Important existing variable:** `MAX_LENGTH`: must be 3000 or less, since that's Slack's hard limit on message length. A backup check also exists in case this is ever misconfigured.
+
+## 3\. New Files and Directories
+
+- `LilLisa_Server/data/verified_techsupport/techsupport_qa_pairs.md`. The verified techsupport Q\&A source file (markdown). Auto-created and appended by the pipeline, and auto-pushed to GitHub (Section 7\) after every update.  
+- `LilLisa_Server/scripts/`. All new standalone scripts (see Section 4).  
+- `LilLisa_Server/scripts/env/techsupport_sync.env` and `LilLisa_Server/scripts/env/github_push.env`. See Section 2\. Both need to be gitignored (already confirmed).  
+- State files, auto-created and gitignored, safe to delete if you want a clean slate since the pipeline will just re-detect everything as new on the next run:  
+  - `LilLisa_Server/scripts/techsupport_sync_state.json`  
+  - `LilLisa_Server/scripts/techsupport_reembed_state.json`  
+  - `LilLisa_Server/scripts/techsupport_review_state.json`  
+  - `LilLisa_Server/scripts/techsupport_thread_tags.json`, new, see Section 4a for what this tracks.
+
+## 4\. Scripts
+
+| Script | Purpose |
+| :---- | :---- |
+| `nightly_pipeline.py` | The main entry point. Orchestrates everything below, including the GitHub push and the live server's index reload. This is what cron should call. |
+| `nightly_techsupport_sync.py` | Detects new or updated threads in the tech support channel. New parents come from `conversations.history` since last run. Known threads are not all polled: nightly hot window + periodic 90-day catch-up, both capped (see the `TECHSUPPORT_SYNC_*` knobs in Section 2). |
+| `techsupport_classifier.py` | Classifies whether a thread is useful and conclusive (DSPy-based |
+| `techsupport_qa_ingest.py` | Extracts a summary from a resolved thread and adds it to the markdown file plus LanceDB, or merges it into an existing entry (see Section 4a). |
+| `techsupport_contextual_reembed.py` | Periodically re-embeds the whole verified table together (late-chunking), on the interval from Section 2\. |
+| `techsupport_review_sync.py` | Picks up manual edits an expert might make directly to the markdown file and syncs them into LanceDB. Fully optional, not a gate. |
+| `techsupport_rollback.py` | `list_available_versions()` and `rollback_to_version(n)`, see Section 8\. |
+| `github_sync.py` | Pushes the current markdown file to the dedicated GitHub repo. Skips the push if the file hasn't actually changed. Called automatically by `nightly_pipeline.py`, but can also be run standalone if a push needs to be retried manually. |
+| `github_anchor.py` | Generates GitHub-accurate anchor slugs from entry titles, so answers can link directly to the right section of the file on GitHub. |
+
+### 4a. Merge/Enrich: avoiding duplicate entries
+
+If Lil Lisa answers a question by citing an existing verified techsupport entry, and the user escalates anyway, any genuinely new insight added in that escalation gets merged into the existing entry instead of creating a near-duplicate one. Here's how that works:
+
+1. When an answer's top source is an existing techsupport entry, that connection is noted in the response.  
+2. If the user escalates, this gets recorded server-side through a new endpoint, `/tag_techsupport_thread/` on `LilLisa_Server`, following the same pattern as `/record_endorsement/`, and tracked in `techsupport_thread_tags.json`.  
+3. When the nightly pipeline later processes that escalation thread, if it's tagged this way, it uses a lighter classification bar. It just needs to be useful, not necessarily fully conclusive on its own, since the point isn't to independently resolve a new question but to add supplementary insight to something already resolved.  
+4. If it passes, the existing entry's content gets updated through an LLM merge call, but its title never changes. That's what keeps the entry's GitHub link stable even as its content grows over time.
+
+## 5\. Cron Setup
+
+cd /path/to/rocknbot/LilLisa\_Server
+
+.venv/bin/python scripts/nightly\_pipeline.py
+
+Recommended cadence is once a day (0 2 \* \* \*). Twice a day (0 2,14 \* \* \*) is a simple option if a bit of extra safety margin is wanted.
+
+The actual update frequency is controlled by `TECHSUPPORT_SYNC_INTERVAL_HOURS` in Section 2, not by how often cron fires, so that's the setting to adjust if a different real cadence is needed.
+
+## 6\. Slack App Configuration
+
+No new scopes are needed beyond what's already configured. The existing bot token and scopes (`app_mentions:read`, `chat:write`, `im:write`, `channels:history`, `channels:read`, `im:history`) cover everything needed for the escalation flow and the nightly scripts.
+
+The bot doesn't have `channels:join`. If it's ever removed from the admin channel, or the admin channel changes someone will need to manually invite it back.
+
+For the real production tech support channel, the bot needs to actually be a member of that channel for the nightly scripts to read its history, or `conversations.history` and `conversations.replies` will fail with `not_in_channel`. 
+
+## 7\. Private GitHub Repo
+
+This is now live and actively syncing. The verified techsupport markdown file gets pushed automatically after every nightly update to a dedicated private repo, `sgodey8/rocknbot_techsupport_qa_pairs`. Every answer that draws on this content includes a working link directly to the relevant section of the file, using GitHub's heading-anchor links, so users can click through and read the full context.
+
+This repo currently lives under my personal GitHub account, matching the existing golden QA pairs repo (`drawal1/rocknbot_qa_pairs`), not a company-owned org account. This can be moved if needed.
+
+### 7a. `github_push.env` setup (devops)
+
+`github_sync.py` (called from `nightly_pipeline.py`) clones that private repo over HTTPS and pushes `techsupport_qa_pairs.md` if it changed. **Same two variables as before** — there is no new env var and no SSH deploy key.
+
+1. Copy the example and fill it in (this file is gitignored):
+
+```
+cd LilLisa_Server/scripts/env
+cp github_push.env.example github_push.env
+```
+
+2. Set:
+
+| Variable | What to put |
+| :---- | :---- |
+| `GITHUB_TOKEN` | A GitHub PAT that can push to the repo in `GITHUB_REPO_URL`. Fine-grained: **Contents: Read and write** on that repo. Classic: `repo` scope for a private repo. |
+| `GITHUB_REPO_URL` | Plain HTTPS clone URL only, e.g. `https://github.com/org/rocknbot_techsupport_qa_pairs.git`. |
+
+3. **Do not put the token in the URL.** These are wrong and will be rejected (or would leak the PAT into `.git/config` / git error logs):
+
+```
+# BAD
+GITHUB_REPO_URL=https://ghp_....@github.com/org/repo.git
+GITHUB_REPO_URL=git@github.com:org/repo.git
+```
+
+The script injects credentials via `GIT_ASKPASS` (a short helper that prints `$GITHUB_TOKEN` when Git asks for a username/password). GitHub accepts the PAT as that password. The clone URL logged at INFO is the clean `https://github.com/...` URL with no secret.
+
+4. **The token must live in `github_push.env`.** `github_sync.py` reads that file only. Exporting `GITHUB_TOKEN` in crontab or the process environment is **not** enough if the file is missing or the keys are empty.
+
+5. Cron does not need extra Git config. The host needs `/bin/sh` (normal Linux runner). A user-level `credential.helper` will not persist this PAT: that clone passes `credential.helper=` so the token is not written to `~/.git-credentials`.
+
+6. Smoke-check after deploy:
+
+```
+cd LilLisa_Server
+.venv/bin/python scripts/github_sync.py
+```
+
+Unchanged markdown prints `{'pushed': False, 'reason': 'unchanged'}`. A real change prints `pushed: True` and a commit message. Logs should show `Cloning https://github.com/...` **without** a token in the URL.
+
+**If push fails:** GitHub 401 / `Authentication failed` almost always means the PAT is expired, lacks Contents write, or `GITHUB_REPO_URL` points at the wrong repo. Rotate the token in `github_push.env` only (not in a clone URL). You should not need to change cron or Git's global config.
+
+## 8\. Rollback Procedure
+
+The verified techsupport LanceDB table (`TECHSUPPORT_QA_PAIRS`) keeps full version history. Every re-embed or bulk write creates a new version instead of overwriting in place. If something goes wrong, like a bad re-embed or corrupted data, you can check what's available:
+
+cd LilLisa\_Server
+
+.venv/bin/python \-c "from scripts.techsupport\_rollback import list\_available\_versions; list\_available\_versions()"
+
+Then roll back to a specific version:
+
+.venv/bin/python \-c "from scripts.techsupport\_rollback import rollback\_to\_version; rollback\_to\_version(N)"
+
+This is non-destructive. Rolling back creates a new version rather than deleting anything, so you can always move forward or backward again afterward.
+
+Now that the GitHub repo in Section 7 is live, the markdown file itself also has real version history through normal git commits, so both the database content and the source file can be inspected or reverted independently if needed.  

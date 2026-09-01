@@ -768,7 +768,14 @@ def answer_from_document_retrieval(
             first_answer_found=answer_found,
             retry_answer_found=retry_answer_found,
         )
-        utils.logger.info("NO_ANSWER_RETRY | %s", json.dumps(log_record, ensure_ascii=False))
+        utils.logger.info(
+            "NO_ANSWER_RETRY | %s",
+            json.dumps(utils.build_no_answer_retry_info_record(log_record), ensure_ascii=False),
+        )
+        utils.logger.debug(
+            "NO_ANSWER_RETRY_DETAIL | %s",
+            json.dumps(log_record, ensure_ascii=False),
+        )
 
         # The retry replaces try-1, including when it is also a no-answer.
         answer_found, llm_response = retry_answer_found, retry_text
