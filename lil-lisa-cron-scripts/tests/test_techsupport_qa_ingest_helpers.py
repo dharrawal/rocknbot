@@ -2,7 +2,7 @@
 Unit tests for defensive techsupport review-state lookup, and a source-level
 check that historical_import_production dry-run uses the public ingest API.
 
-Run from LilLisa_Server:
+Run from lil-lisa-cron-scripts:
     PYTHONPATH=. python3 tests/test_techsupport_qa_ingest_helpers.py
 """
 
@@ -11,7 +11,7 @@ import sys
 import unittest
 from pathlib import Path
 
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from techsupport_review_state import node_ids_from_review_entry, review_entry_state  # noqa: E402

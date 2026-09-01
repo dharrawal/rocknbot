@@ -156,27 +156,45 @@ Customer/employee questions and model output land in production logs. `DEBUG_NO_
 - **Done:** Full query/history/answer/refine/retry JSON moved to DEBUG (not dropped). INFO heartbeats: Slack `[GET_ANS] conv_id=… http_status=… bytes=… elapsed_ms=…`; server `invoke session_id=… product=… query_chars=… answer_found=… elapsed_ms=… outcome=…`; escalate lines keep ids/counts/char lengths. `NO_ANSWER_RETRY` INFO is metadata only; full payload is `NO_ANSWER_RETRY_DETAIL` at DEBUG.
 - **Beads:** `pr42-hp.2.2` **closed**. Parent SECURITY epic `pr42-hp.2` **closed**.
 
-### PERFORMANCE (`pr42-hp.3`)
+### PERFORMANCE (`pr42-hp.3`) — **closed** (2/2 children closed)
 
 `**dspy>=2.6.27` added to the server runtime** (`pr42-hp.3.1`)  
 Nothing under `src/` imports `dspy`. It is used by pipeline scripts. Putting it in default `dependencies` (and large `uv.lock` churn) bloats the API image. Prefer an optional extra (`[project.optional-dependencies] pipeline`) or a separate scripts package.
 
+- **Done:** Moved pipeline jobs to top-level `lil-lisa-cron-scripts/` with its own `pyproject.toml` (`dspy>=2.6.27` + path dep on `LilLisa_Server`). Removed `dspy` from `LilLisa_Server` default dependencies and regenerated `uv.lock` (DSPy and related packages dropped from the API lock). Cron: `make setup-env` then `python nightly_pipeline.py`. Thread tags stay at `LilLisa_Server/scripts/techsupport_thread_tags.json` (API writes them). Tests: `lil-lisa-cron-scripts/tests/`.
+- **Beads:** `pr42-hp.3.1` **closed**.
+
 **Blocking `requests` on the Bolt async loop** (`pr42-hp.3.2`)  
 `get_ans` already did this. Escalation adds `tag_techsupport_thread`, `fetch_conversation_history`, and `get_refined_escalation_query` as sync `requests` inside `async def`. A slow refine (60s timeout) stalls every other Slack handler. Use `httpx.AsyncClient` / `aiohttp`, or `asyncio.to_thread`.
 
-### RELIABILITY (`pr42-hp.4`)
+- **Done:** `await asyncio.to_thread(...)` via `_requests_call` in `lil-lisa/src/slack.py` for every `requests.post` / `requests.get` in that module (including `get_ans` and the three escalation helpers).
+- **Beads:** `pr42-hp.3.2` **closed**. Parent PERFORMANCE epic `pr42-hp.3` **closed**.
+
+### RELIABILITY (`pr42-hp.4`) — **closed** (4/4 children closed)
 
 **Race on `techsupport_thread_tags.json`** (`pr42-hp.4.1`)  
 Read whole file → mutate dict → write. Two concurrent escalations can drop a tag. Write to a temp file and `os.replace`, and serialize with a lock (or SQLite). Lost tags mean duplicate verified entries instead of merge.
 
+- **Done:** `upsert_thread_tag` in `LilLisa_Server/src/techsupport_thread_tags.py` loads, sets the key, and `atomic_write_json` (temp + `os.replace`). `POST /tag_techsupport_thread/` holds `THREAD_TAGS_LOCK` around the upsert. Tests: `LilLisa_Server/tests/test_techsupport_thread_tags.py`.
+- **Beads:** `pr42-hp.4.1` **closed**.
+
 `**ENDORSEMENT_TRACKER` is process memory** (`pr42-hp.4.2`)  
 Restart clears `escalated`. Bot talks again in the original thread; users can escalate twice. Same as old endorsement tracking, but silence-after-escalate is a product promise. Persist (Speedict/sqlite) or document the restart behavior.
+
+- **Done:** Persist **only** successful escalations in `lil-lisa/escalation_tracker.json` (gitignored; override `ESCALATION_TRACKER_PATH`). Max age 90 days (`ESCALATION_MAX_AGE_DAYS`). Thumbs stay RAM-only. `claim_escalation` before the tech-support post; `clear_escalation` on post failure. `process_msg` silence checks the persisted store (expired rows no longer silence). Tests: `lil-lisa/tests/test_escalation_tracker.py`.
+- **Beads:** `pr42-hp.4.2` **closed**.
 
 `**configure_dspy_lm()` at import time** (`pr42-hp.4.3`)  
 `techsupport_classifier.py` and `techsupport_qa_ingest.py` call it at module load. Importing `nightly_pipeline` requires LLM key files even for `--help` or unit-test parsers. Configure lazily inside `classify_thread` / summarize.
 
+- **Done:** Idempotent lazy `configure_dspy_lm()`; called from `classify_thread`, `generate_verified_title_and_summary`, `enrich_verified_entry`, `historical_import.convert_entry`, and `historical_revert_to_prose._generate_title_with_retry`. Module-level calls removed. Tests: `lil-lisa-cron-scripts/tests/test_lazy_dspy_configure.py`.
+- **Beads:** `pr42-hp.4.3` **closed**. Parent RELIABILITY epic `pr42-hp.4` **closed**.
+
 `**github_sync.load_env` ignores `os.environ**` (`pr42-hp.4.4`)  
 Every other script does dotenv then overlay env. Cron/`GITHUB_TOKEN` in the environment will be ignored if the file is empty. Inconsistent and surprising in deploy.
+
+- **Done:** Same `{**dotenv_values(...), **os.environ}` overlay as `nightly_techsupport_sync.load_env`. Empty file placeholders no longer shadow a real process-env token. Tests: `lil-lisa-cron-scripts/tests/test_github_sync.py`.
+- **Beads:** `pr42-hp.4.4` **closed**.
 
 ### INSTRUMENTATION (`pr42-hp.5`)
 

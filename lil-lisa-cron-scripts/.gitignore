@@ -1,0 +1,15 @@
+.venv/
+.mypy_cache/
+__pycache__/
+
+# Credential env files (keep *.example)
+env/*
+!env/*.example
+
+# Local pipeline state (safe to delete; next run rediscovers)
+techsupport_sync_state.json
+techsupport_reembed_state.json
+techsupport_review_state.json
+historical_import_state.json
+historical_import_production_state.json
+historical_revert_state.json

@@ -62,16 +62,17 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
+from paths import LILLISA_SERVER_ROOT, PACKAGE_ROOT, ensure_import_paths
+
+ensure_import_paths()
+SCRIPT_DIR = PACKAGE_ROOT
+PROJECT_ROOT = LILLISA_SERVER_ROOT
 SUMMARIES_DIR = PROJECT_ROOT / "data" / "historical_import" / "summaries"
 HISTORICAL_IMPORT_STATE_PATH = SCRIPT_DIR / "historical_import_state.json"
 REVERT_STATE_PATH = SCRIPT_DIR / "historical_revert_state.json"
 EXPECTED_CONVERTED_COUNT = 638
 
-sys.path.insert(0, str(SCRIPT_DIR))
-sys.path.insert(0, str(PROJECT_ROOT))
-
+from techsupport_classifier import configure_dspy_lm  # noqa: E402
 from techsupport_qa_ingest import (  # noqa: E402
     TECHSUPPORT_QA_MARKDOWN_FILENAME,
     VERIFIED_TECHSUPPORT_QA_FOLDERPATH,
@@ -158,6 +159,7 @@ def _generate_title_with_retry(summary: str) -> str:
     """generate_title() wrapped with backoff for transient provider rate
     limits (seen in practice against the Mistral endpoint) -- dspy's own
     internal retries aren't enough to ride out a sustained rate-limit window."""
+    configure_dspy_lm()
     for attempt in range(1, MAX_TITLE_RETRIES + 1):
         try:
             return generate_title(summary=summary).title.strip()

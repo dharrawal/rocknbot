@@ -53,14 +53,15 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import requests
 from dotenv import dotenv_values
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
-sys.path.insert(0, str(SCRIPT_DIR))
+from paths import LILLISA_SERVER_ENV_PATH, LILLISA_SERVER_ROOT, PACKAGE_ROOT, ensure_import_paths
+
+ensure_import_paths()
+SCRIPT_DIR = PACKAGE_ROOT
+PROJECT_ROOT = LILLISA_SERVER_ROOT
 
 from atomic_io import atomic_write_json  # noqa: E402
 
 ENV_PATH = SCRIPT_DIR / "env" / "techsupport_sync.env"
-LILLISA_SERVER_ENV_PATH = PROJECT_ROOT / "env" / "lillisa_server.env"
 STATE_PATH = SCRIPT_DIR / "techsupport_sync_state.json"
 
 SLACK_API_BASE = "https://slack.com/api"

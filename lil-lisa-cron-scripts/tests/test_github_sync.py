@@ -1,7 +1,7 @@
 """
 Unit tests for github_sync GIT_ASKPASS auth (token never in clone URL).
 
-Run from LilLisa_Server:
+Run from lil-lisa-cron-scripts:
     PYTHONPATH=. python3 tests/test_github_sync.py
 """
 
@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 sys.modules.setdefault("git", MagicMock())
@@ -82,6 +82,30 @@ class GitAskpassTests(unittest.TestCase):
                 result = github_sync.push_verified_qa_pairs()
 
         self.assertTrue(result["pushed"])
+
+    def test_load_env_overlays_process_environment_over_empty_file(self):
+        with patch.object(
+            github_sync,
+            "dotenv_values",
+            return_value={"GITHUB_TOKEN": "", "GITHUB_REPO_URL": "https://github.com/org/repo.git"},
+        ), patch.dict(
+            os.environ,
+            {"GITHUB_TOKEN": "from-env-secret", "GITHUB_REPO_URL": "https://github.com/org/repo.git"},
+            clear=False,
+        ):
+            env = github_sync.load_env()
+        self.assertEqual(env["GITHUB_TOKEN"], "from-env-secret")
+        self.assertEqual(env["GITHUB_REPO_URL"], "https://github.com/org/repo.git")
+
+    def test_load_env_raises_when_token_missing_in_file_and_environment(self):
+        with patch.object(
+            github_sync,
+            "dotenv_values",
+            return_value={"GITHUB_TOKEN": "", "GITHUB_REPO_URL": ""},
+        ), patch.dict(os.environ, {"GITHUB_TOKEN": "", "GITHUB_REPO_URL": ""}, clear=False):
+            with self.assertRaises(RuntimeError) as ctx:
+                github_sync.load_env()
+        self.assertIn("GITHUB_TOKEN", str(ctx.exception))
 
 
 if __name__ == "__main__":

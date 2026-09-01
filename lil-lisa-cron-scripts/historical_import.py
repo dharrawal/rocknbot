@@ -75,13 +75,13 @@ from typing import Any, Dict, List, Optional
 
 import dspy
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
+from paths import LILLISA_SERVER_ROOT, PACKAGE_ROOT, ensure_import_paths
+
+ensure_import_paths()
+SCRIPT_DIR = PACKAGE_ROOT
+PROJECT_ROOT = LILLISA_SERVER_ROOT
 SUMMARIES_DIR = PROJECT_ROOT / "data" / "historical_import" / "summaries"
 STATE_PATH = SCRIPT_DIR / "historical_import_state.json"
-
-sys.path.insert(0, str(SCRIPT_DIR))
-sys.path.insert(0, str(PROJECT_ROOT))
 
 from techsupport_classifier import configure_dspy_lm  # noqa: E402
 from techsupport_qa_ingest import append_summary_to_markdown  # noqa: E402
@@ -103,8 +103,6 @@ import techsupport_contextual_reembed  # noqa: E402
 # into a plain prose-summary signature (no question/answer split, matching
 # techsupport_qa_ingest.SummarizeConversationThread) plus a real title-generation
 # call, following historical_revert_to_prose.py's pattern.
-
-configure_dspy_lm()
 
 
 # --- Parsing: 36 files -> flat, ordered list of individual summary entries ---
@@ -206,6 +204,7 @@ def convert_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     {"outcome": "converted", "question", "answer"} or
     {"outcome": "skipped", "reason"}. Raises on LLM/parsing failure -- the
     caller records that as an "error" outcome (retryable on the next run)."""
+    configure_dspy_lm()
     extracted = extract_qa_from_summary(conversation_summary=entry["text"])
     has_resolution = extracted.has_resolution.strip().lower()
     question = extracted.question.strip()

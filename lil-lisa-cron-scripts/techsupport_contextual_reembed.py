@@ -87,13 +87,12 @@ from dotenv import dotenv_values
 from llama_index.core import Settings, StorageContext, VectorStoreIndex
 from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, TextNode
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
-LILLISA_SERVER_ENV_PATH = PROJECT_ROOT / "env" / "lillisa_server.env"
-STATE_PATH = SCRIPT_DIR / "techsupport_reembed_state.json"
+from paths import LILLISA_SERVER_ENV_PATH, LILLISA_SERVER_ROOT, PACKAGE_ROOT, ensure_import_paths
 
-sys.path.insert(0, str(SCRIPT_DIR))
-sys.path.insert(0, str(PROJECT_ROOT))
+ensure_import_paths()
+SCRIPT_DIR = PACKAGE_ROOT
+PROJECT_ROOT = LILLISA_SERVER_ROOT
+STATE_PATH = SCRIPT_DIR / "techsupport_reembed_state.json"
 
 from github_anchor import compute_github_urls_for_titles  # noqa: E402
 from atomic_io import atomic_write_json  # noqa: E402

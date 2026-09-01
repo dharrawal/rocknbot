@@ -22,6 +22,12 @@ from slack_bolt.adapter.socket_mode.async_handler import (  # type: ignore
 from slack_bolt.async_app import AsyncApp  # type: ignore
 from slack_sdk.errors import SlackApiError  # type: ignore
 
+from escalation_tracker import (
+    claim_escalation,
+    clear_escalation,
+    hydrate_endorsement_tracker,
+    is_escalation_active,
+)
 from utils import logger, parse_get_ans_result
 
 lil_lisa_env = dotenv_values("./app_envfiles/lil-lisa.env")
@@ -72,6 +78,11 @@ TIMEOUT = 10
 app = AsyncApp(token=SLACK_BOT_TOKEN)
 
 
+async def _requests_call(func, *args, **kwargs):
+    """Run a blocking `requests` call in a thread so the Bolt event loop stays free."""
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
 BOT_USER_ID: str = None
 RERANK_CACHE: Dict[str, List[Dict[str, str]]] = {}
 ESCALATE_ACTION_ID = "escalate_to_techsupport"
@@ -79,7 +90,10 @@ ESCALATE_ACTION_ID = "escalate_to_techsupport"
 ESCALATE_VALUE_QUERY_MAX_LENGTH = 1500
 # Dictionary to track which message threads have already been endorsed or escalated
 # Format: {conv_id: {"message_endorsed": True/False, "reaction_endorsed": "up"/"down"/False, "escalated": True/False}}
+# Thumbs stay in process memory. Successful escalations are also persisted
+# (escalation_tracker.json, 90-day TTL) so silence-after-escalate survives restart.
 ENDORSEMENT_TRACKER: Dict[str, Dict[str, Any]] = {}
+hydrate_endorsement_tracker(ENDORSEMENT_TRACKER)
 
 ESCALATE_BUTTON_TEXT = "Post question in tech support channel"
 ESCALATE_NOTE_TEXT = (
@@ -420,7 +434,7 @@ async def handle_message_events(event, say):
     # no post). Checked here, before the conversations_replies fetch below (which exists only
     # to count participants for the "should we respond" decision), so an escalated thread
     # costs nothing beyond this dict lookup.
-    if ENDORSEMENT_TRACKER.get(conv_id, {}).get("escalated"):
+    if is_escalation_active(conv_id):
         logger.info(f"[ESCALATED SILENCE] Thread {conv_id} already escalated to techsupport, staying silent.")
         return
 
@@ -464,7 +478,7 @@ async def get_ans(query, thread_id, msg_id, product, is_expert_answering):
     try:
         # Call the invoke API
         full_url = f"{BASE_URL}/invoke/"
-        response = requests.post(
+        response = await _requests_call(requests.post, 
             full_url,
             params={
                 "session_id": str(conv_id),  # pylint: disable=missing-timeout
@@ -567,7 +581,7 @@ async def add_expert_verified_qa_pair(item_ts, channel_id, expert_user_id):
         # Call the new endpoint to add the QA pair
         full_url = f"{BASE_URL}/add_expert_qa_pair/"
         
-        response = requests.post(
+        response = await _requests_call(requests.post, 
             full_url,
             json={
                 "question": user_question,
@@ -652,7 +666,7 @@ async def record_endorsement(conv_id, is_expert, thumbs_up, endorsement_type="re
             }
             
             # Use json parameter for request body
-            requests.post(
+            await _requests_call(requests.post, 
                 full_url,
                 params=params,
                 json=json_data,
@@ -660,7 +674,7 @@ async def record_endorsement(conv_id, is_expert, thumbs_up, endorsement_type="re
             )
         else:
             # Regular response endorsement - all parameters already in params
-            requests.post(
+            await _requests_call(requests.post, 
                 full_url,
                 params=params,
                 timeout=60,
@@ -675,7 +689,7 @@ async def tag_techsupport_thread(thread_ts: str, related_entry_title: str) -> No
     a duplicate. Best-effort: failures are logged and swallowed, never block escalation."""
     try:
         full_url = f"{BASE_URL}/tag_techsupport_thread/"
-        requests.post(
+        await _requests_call(requests.post, 
             full_url,
             params={
                 "thread_ts": thread_ts,
@@ -690,7 +704,7 @@ async def tag_techsupport_thread(thread_ts: str, related_entry_title: str) -> No
 async def fetch_conversation_history(session_id) -> str:
     """Fetch the full conversation history for a session from the LilLisa_Server."""
     full_url = f"{BASE_URL}/get_conversation_history/"
-    response = requests.get(
+    response = await _requests_call(requests.get, 
         full_url,
         params={
             "session_id": str(session_id),
@@ -705,7 +719,7 @@ async def fetch_conversation_history(session_id) -> str:
 async def get_refined_escalation_query(conversation_history: str) -> str:
     """Ask the LilLisa_Server to combine a multi-message thread into one faithful question for escalation."""
     full_url = f"{BASE_URL}/refine_escalation_query/"
-    response = requests.post(
+    response = await _requests_call(requests.post, 
         full_url,
         json={"conversation_history": conversation_history},
         params={"encrypted_key": ENCRYPTED_AUTHENTICATION_KEY},
@@ -868,6 +882,7 @@ async def process_msg(event, say):
 
 def clear_escalation_claim(conv_id: str) -> None:
     """Undo check_and_update_endorsement(..., "escalated") after a failed tech-support post."""
+    clear_escalation(conv_id)
     entry = ENDORSEMENT_TRACKER.get(conv_id)
     if not entry or not entry.get("escalated"):
         return
@@ -1324,8 +1339,14 @@ def check_and_update_endorsement(conv_id, action_type="endorsed", endorsement_so
     elif "escalated" not in ENDORSEMENT_TRACKER[conv_id]:
         ENDORSEMENT_TRACKER[conv_id]["escalated"] = False
 
-    # Handle techsupport escalation action
+    # Handle techsupport escalation action. Persist before flipping RAM so a
+    # crash after disk write still looks escalated after restart (duplicate
+    # click is safer than a double post).
     if action_type == "escalated":
+        if not claim_escalation(conv_id):
+            logger.info(f"[DUPLICATE ESCALATED] Conv {conv_id} already has escalated=True")
+            ENDORSEMENT_TRACKER[conv_id]["escalated"] = True
+            return False
         return update_tracker_entry(conv_id, "escalated", True)
 
     # Handle endorsement actions
@@ -1427,7 +1448,7 @@ async def get_golden_qa_pairs(ack, body, say):
     try:
         # Call the get_golden_qa_pairs API
         full_url = f"{BASE_URL}/get_golden_qa_pairs/"
-        if response := requests.post(
+        if response := await _requests_call(requests.post, 
             full_url,
             params={
                 "product": product,  # pylint: disable=missing-timeout
@@ -1488,7 +1509,7 @@ async def update_golden_qa_pairs(ack, body, say):    # pylint: disable=too-many-
     try:
         # Call the update_golden_qa_pairs API
         full_url = f"{BASE_URL}/update_golden_qa_pairs/"
-        if response := requests.post(
+        if response := await _requests_call(requests.post, 
             full_url,
             params={
                 "product": product,  # pylint: disable=missing-timeout
@@ -1551,7 +1572,7 @@ async def update_golden_qa_pairs(ack, body, say):    # pylint: disable=too-many-
 #     try:
 #         # Call the rebuild_docs API
 #         full_url = f"{BASE_URL}/rebuild_docs/"
-#         if response := requests.post(
+#         if response := await _requests_call(requests.post, 
 #             full_url,
 #             params={"encrypted_key": ENCRYPTED_AUTHENTICATION_KEY},
 #             timeout=2700,
@@ -1609,7 +1630,7 @@ async def rebuild_docs_traditional(ack, body, say):
     try:
         # Call the rebuild_docs_traditional API
         full_url = f"{BASE_URL}/rebuild_docs_traditional/"
-        if response := requests.post(
+        if response := await _requests_call(requests.post, 
             full_url,
             params={"encrypted_key": ENCRYPTED_AUTHENTICATION_KEY},
             timeout=2700,
@@ -1667,7 +1688,7 @@ async def rebuild_docs_contextual(ack, body, say):
     try:
         # Call the rebuild_docs_contextual API
         full_url = f"{BASE_URL}/rebuild_docs_contextual/"
-        if response := requests.post(
+        if response := await _requests_call(requests.post, 
             full_url,
             params={"encrypted_key": ENCRYPTED_AUTHENTICATION_KEY},
             timeout=2700,
@@ -1721,7 +1742,7 @@ async def cleanup_sessions(ack, body, say):
     try:
         # Call the cleanup_sessions API
         full_url = f"{BASE_URL}/cleanup_sessions/"
-        response = requests.post(
+        response = await _requests_call(requests.post, 
             full_url,
             params={"encrypted_key": ENCRYPTED_AUTHENTICATION_KEY},
             timeout=60,

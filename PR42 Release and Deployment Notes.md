@@ -18,7 +18,7 @@ This adds two things to Rocknbot. First, a real-time escalation flow that lets L
 | `TECHSUPPORT_REEMBED_INTERVAL_DAYS` | `7` | How often the verified techsupport table gets a full contextual re-embed (late-chunking refresh). Expert-adjustable. |
 | `VERIFIED_TECHSUPPORT_QA_FOLDERPATH` | `data/verified_techsupport/` | Where the verified techsupport markdown file lives locally, before it gets pushed to the GitHub repo (see Section 7). |
 
-### `LilLisa_Server/scripts/env/techsupport_sync.env` (dedicated file)
+### `lil-lisa-cron-scripts/env/techsupport_sync.env` (dedicated file)
 
 | Variable | Purpose |
 | :---- | :---- |
@@ -28,7 +28,7 @@ This adds two things to Rocknbot. First, a real-time escalation flow that lets L
 
 This is a separate env file from `lil-lisa`'s on purpose, so the nightly scripts can run standalone (for example as their own cron job) without depending on `lil-lisa`'s directory or config existing.
 
-### `LilLisa_Server/scripts/env/github_push.env` (dedicated file, new)
+### `lil-lisa-cron-scripts/env/github_push.env` (dedicated file, new)
 
 | Variable | Purpose |
 | :---- | :---- |
@@ -47,13 +47,13 @@ This is a separate env file from `lil-lisa`'s on purpose, so the nightly scripts
 ## 3\. New Files and Directories
 
 - `LilLisa_Server/data/verified_techsupport/techsupport_qa_pairs.md`. The verified techsupport Q\&A source file (markdown). Auto-created and appended by the pipeline, and auto-pushed to GitHub (Section 7\) after every update.  
-- `LilLisa_Server/scripts/`. All new standalone scripts (see Section 4).  
-- `LilLisa_Server/scripts/env/techsupport_sync.env` and `LilLisa_Server/scripts/env/github_push.env`. See Section 2\. Both need to be gitignored (already confirmed).  
+- `lil-lisa-cron-scripts/`. Nightly/cron Python jobs (see Section 4). Own `pyproject.toml` (includes DSPy). The LilLisa_Server API image does **not** install this package.  
+- `lil-lisa-cron-scripts/env/techsupport_sync.env` and `lil-lisa-cron-scripts/env/github_push.env`. See Section 2\. Both need to be gitignored (already confirmed).  
 - State files, auto-created and gitignored, safe to delete if you want a clean slate since the pipeline will just re-detect everything as new on the next run:  
-  - `LilLisa_Server/scripts/techsupport_sync_state.json`  
-  - `LilLisa_Server/scripts/techsupport_reembed_state.json`  
-  - `LilLisa_Server/scripts/techsupport_review_state.json`  
-  - `LilLisa_Server/scripts/techsupport_thread_tags.json`, new, see Section 4a for what this tracks.
+  - `lil-lisa-cron-scripts/techsupport_sync_state.json`  
+  - `lil-lisa-cron-scripts/techsupport_reembed_state.json`  
+  - `lil-lisa-cron-scripts/techsupport_review_state.json`  
+  - `LilLisa_Server/scripts/techsupport_thread_tags.json`, written by the running API (`POST /tag_techsupport_thread/`). Cron only reads this file; see Section 4a.
 
 ## 4\. Scripts
 
@@ -80,9 +80,13 @@ If Lil Lisa answers a question by citing an existing verified techsupport entry,
 
 ## 5\. Cron Setup
 
-cd /path/to/rocknbot/LilLisa\_Server
+One-time: `cd /path/to/rocknbot/lil-lisa-cron-scripts && make setup-env` (installs DSPy plus a path dependency on `LilLisa_Server`). Cron:
 
-.venv/bin/python scripts/nightly\_pipeline.py
+cd /path/to/rocknbot/lil-lisa-cron-scripts
+
+.venv/bin/python nightly\_pipeline.py
+
+The jobs resolve `../LilLisa_Server` for env, LanceDB, and `src/` imports (override with `LILLISA_SERVER_ROOT` if needed). If you already have pipeline state JSON under the old `LilLisa_Server/scripts/` location, copy `techsupport_sync_state.json`, `techsupport_reembed_state.json`, and `techsupport_review_state.json` into `lil-lisa-cron-scripts/`. Leave `techsupport_thread_tags.json` where the API writes it (`LilLisa_Server/scripts/`).
 
 Recommended cadence is once a day (0 2 \* \* \*). Twice a day (0 2,14 \* \* \*) is a simple option if a bit of extra safety margin is wanted.
 
@@ -109,7 +113,7 @@ This repo currently lives under my personal GitHub account, matching the existin
 1. Copy the example and fill it in (this file is gitignored):
 
 ```
-cd LilLisa_Server/scripts/env
+cd lil-lisa-cron-scripts/env
 cp github_push.env.example github_push.env
 ```
 
@@ -137,8 +141,8 @@ The script injects credentials via `GIT_ASKPASS` (a short helper that prints `$G
 6. Smoke-check after deploy:
 
 ```
-cd LilLisa_Server
-.venv/bin/python scripts/github_sync.py
+cd lil-lisa-cron-scripts
+.venv/bin/python github_sync.py
 ```
 
 Unchanged markdown prints `{'pushed': False, 'reason': 'unchanged'}`. A real change prints `pushed: True` and a commit message. Logs should show `Cloning https://github.com/...` **without** a token in the URL.
@@ -149,13 +153,13 @@ Unchanged markdown prints `{'pushed': False, 'reason': 'unchanged'}`. A real cha
 
 The verified techsupport LanceDB table (`TECHSUPPORT_QA_PAIRS`) keeps full version history. Every re-embed or bulk write creates a new version instead of overwriting in place. If something goes wrong, like a bad re-embed or corrupted data, you can check what's available:
 
-cd LilLisa\_Server
+cd lil-lisa-cron-scripts
 
-.venv/bin/python \-c "from scripts.techsupport\_rollback import list\_available\_versions; list\_available\_versions()"
+.venv/bin/python \-c "from techsupport_rollback import list_available_versions; list_available_versions()"
 
 Then roll back to a specific version:
 
-.venv/bin/python \-c "from scripts.techsupport\_rollback import rollback\_to\_version; rollback\_to\_version(N)"
+.venv/bin/python \-c "from techsupport_rollback import rollback_to_version; rollback_to_version(N)"
 
 This is non-destructive. Rolling back creates a new version rather than deleting anything, so you can always move forward or backward again afterward.
 

@@ -42,8 +42,11 @@ from urllib.parse import urlsplit
 import git
 from dotenv import dotenv_values
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
+from paths import LILLISA_SERVER_ROOT, PACKAGE_ROOT, ensure_import_paths
+
+ensure_import_paths()
+SCRIPT_DIR = PACKAGE_ROOT
+PROJECT_ROOT = LILLISA_SERVER_ROOT
 ENV_PATH = SCRIPT_DIR / "env" / "github_push.env"
 
 # Deliberately duplicated from techsupport_qa_ingest.py rather than imported
@@ -70,11 +73,13 @@ COMMIT_AUTHOR = git.Actor("LilLisa Techsupport Pipeline", "noreply@radiantlogic.
 
 
 def load_env() -> Dict[str, str]:
-    """Reads GITHUB_TOKEN / GITHUB_REPO_URL from scripts/env/github_push.env."""
+    """Reads GITHUB_TOKEN / GITHUB_REPO_URL from env/github_push.env, then
+    overlays os.environ so cron/k8s secrets win over empty file placeholders."""
     env = dict(dotenv_values(str(ENV_PATH)))
+    env = {**env, **os.environ}
     missing = [key for key in REQUIRED_ENV_VARS if not env.get(key)]
     if missing:
-        raise RuntimeError(f"Missing required env var(s) {missing} - expected in {ENV_PATH}")
+        raise RuntimeError(f"Missing required env var(s) {missing} - expected in {ENV_PATH} or the process environment")
     return env
 
 

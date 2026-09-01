@@ -14,8 +14,8 @@ against what actually happened in each thread.
 are unoptimized zero-shot outputs with no validation data or tuning behind
 them yet. This script is for manual eyeballing, not a benchmark. ***
 
-Usage (from LilLisa_Server):
-    python3 smoke/techsupport_classifier.py [thread_ts ...]
+Usage (from LilLisa_Server, with cron scripts on PYTHONPATH):
+    PYTHONPATH=../lil-lisa-cron-scripts python3 smoke/techsupport_classifier.py [thread_ts ...]
 
 With no args, picks up to 4 thread_ts already tracked in
 techsupport_sync_state.json, preferring ones that have actual reply activity
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import List
 
 SMOKE_DIR = Path(__file__).resolve().parent
-SCRIPTS_DIR = SMOKE_DIR.parent / "scripts"
+SCRIPTS_DIR = SMOKE_DIR.parent.parent / "lil-lisa-cron-scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from nightly_techsupport_sync import load_env, load_state, paginate_messages  # noqa: E402

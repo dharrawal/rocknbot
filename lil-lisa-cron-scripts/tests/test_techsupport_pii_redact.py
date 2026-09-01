@@ -1,7 +1,7 @@
 """
 Unit tests for obvious-PII redaction on generated techsupport title/summary text.
 
-Run from LilLisa_Server:
+Run from lil-lisa-cron-scripts:
     PYTHONPATH=. python3 tests/test_techsupport_pii_redact.py
 """
 
@@ -9,7 +9,7 @@ import sys
 import unittest
 from pathlib import Path
 
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from techsupport_pii import PII_REDACTED_PLACEHOLDER, redact_obvious_pii  # noqa: E402

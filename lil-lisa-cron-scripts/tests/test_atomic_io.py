@@ -1,7 +1,7 @@
 """
 Unit tests for atomic JSON/text writes (temp + os.replace).
 
-Run from LilLisa_Server:
+Run from lil-lisa-cron-scripts:
     PYTHONPATH=. python3 tests/test_atomic_io.py
 """
 
@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from atomic_io import atomic_write_json, atomic_write_text  # noqa: E402

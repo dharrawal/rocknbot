@@ -100,12 +100,11 @@ from dotenv import dotenv_values
 from llama_index.core import Document, Settings, StorageContext, VectorStoreIndex
 from llama_index.core.node_parser import SentenceSplitter
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
-LILLISA_SERVER_ENV_PATH = PROJECT_ROOT / "env" / "lillisa_server.env"
+from paths import LILLISA_SERVER_ENV_PATH, LILLISA_SERVER_ROOT, PACKAGE_ROOT, THREAD_TAGS_PATH, ensure_import_paths
 
-sys.path.insert(0, str(SCRIPT_DIR))
-sys.path.insert(0, str(PROJECT_ROOT))
+ensure_import_paths()
+SCRIPT_DIR = PACKAGE_ROOT
+PROJECT_ROOT = LILLISA_SERVER_ROOT
 
 from github_anchor import compute_github_urls_for_titles  # noqa: E402
 from atomic_io import atomic_write_json, atomic_write_text  # noqa: E402
@@ -165,9 +164,7 @@ REVIEW_STATE_PATH = SCRIPT_DIR / "techsupport_review_state.json"
 # nightly_pipeline.py consults to decide whether a freshly-classified thread
 # should be merged into that existing entry (enrich_verified_entry) instead
 # of added as a new one.
-THREAD_TAGS_PATH = SCRIPT_DIR / "techsupport_thread_tags.json"
-
-configure_dspy_lm()
+# THREAD_TAGS_PATH is defined in paths.py (LilLisa_Server/scripts/).
 
 
 def load_review_state() -> Dict[str, Any]:
@@ -345,6 +342,7 @@ def generate_verified_title_and_summary(conversation_thread: str) -> Dict[str, s
 
     Returns {"title", "summary"}.
     """
+    configure_dspy_lm()
     summary = summarize_conversation(conversation_thread=conversation_thread).summary.strip()
     title = generate_title(summary=summary).title.strip()
     title, summary = _redact_generated_title_and_summary(title, summary)
@@ -644,6 +642,7 @@ def enrich_verified_entry(existing_title: str, new_thread_conversation: str) -> 
     exact title -- the caller (nightly_pipeline.py) falls back to a normal add in
     that case rather than failing the whole thread.
     """
+    configure_dspy_lm()
     markdown_filepath = VERIFIED_TECHSUPPORT_QA_FOLDERPATH / TECHSUPPORT_QA_MARKDOWN_FILENAME
     if not markdown_filepath.exists():
         raise LookupError(f"No verified techsupport markdown file found -- cannot enrich {existing_title!r}")

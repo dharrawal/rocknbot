@@ -8,26 +8,13 @@
 env/*
 !env/*.example
 
-# Ignore tool-specific credential env files
+# Ignore tool-specific credential env files if any remain under scripts/env
 scripts/env/*
 !scripts/env/*.example
 
-# Ignore nightly techsupport sync local state
-scripts/techsupport_sync_state.json
-
-# Ignore techsupport contextual re-embed local state
-scripts/techsupport_reembed_state.json
-
-# Ignore techsupport expert-review sync local state
-scripts/techsupport_review_state.json
-
-# Ignore techsupport escalation-thread related-entry tags local state
+# Escalation tags written by POST /tag_techsupport_thread/ (API process).
+# Cron jobs live in ../lil-lisa-cron-scripts and read this same path.
 scripts/techsupport_thread_tags.json
-
-# Ignore one-time historical import/revert local run-state files
-scripts/historical_import_state.json
-scripts/historical_import_production_state.json
-scripts/historical_revert_state.json
 
 # Ignore Docker ignore files
 .dockerignore

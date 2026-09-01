@@ -2,7 +2,7 @@
 Unit tests for nightly techsupport thread-update detection (hot window,
 catch-up age cap, parent latest_reply lookups).
 
-Run from LilLisa_Server:
+Run from lil-lisa-cron-scripts:
     PYTHONPATH=. python3 tests/test_nightly_techsupport_sync.py
 """
 
@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import List
 from unittest.mock import patch
 
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import nightly_techsupport_sync as sync_mod  # noqa: E402

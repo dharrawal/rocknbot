@@ -100,15 +100,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
+from paths import LILLISA_SERVER_ROOT, PACKAGE_ROOT, ensure_import_paths
+
+ensure_import_paths()
+SCRIPT_DIR = PACKAGE_ROOT
+PROJECT_ROOT = LILLISA_SERVER_ROOT
 PRODUCTION_FILE = PROJECT_ROOT / "data" / "historical_import" / "production_1year.txt"
 STATE_PATH = SCRIPT_DIR / "historical_import_production_state.json"
 SOURCE_ID = "production_1year.txt"
 EXPECTED_CONVERSATION_COUNT = 171
-
-sys.path.insert(0, str(SCRIPT_DIR))
-sys.path.insert(0, str(PROJECT_ROOT))
 
 from nightly_techsupport_sync import load_env  # noqa: E402
 from techsupport_classifier import classify_thread  # noqa: E402

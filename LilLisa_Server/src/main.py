@@ -72,6 +72,7 @@ from src.lillisa_server_context import LOCALE, LilLisaServerContext
 from src.llama_index_lancedb_vector_store import LanceDBVectorStore
 from src.llama_index_markdown_reader import MarkdownReader
 
+from src.techsupport_thread_tags import THREAD_TAGS_LOCK, upsert_thread_tag
 from src import observability
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
@@ -1195,7 +1196,7 @@ async def reload_techsupport_qa_pairs(encrypted_key: str) -> dict:
     Rebuilds the in-memory QA pairs retrievers/indices (including
     TECHSUPPORT_QA_PAIRS) from the current on-disk LanceDB tables.
 
-    scripts/nightly_pipeline.py and scripts/techsupport_qa_ingest.py write new
+    lil-lisa-cron-scripts/nightly_pipeline.py and techsupport_qa_ingest.py write new
     verified techsupport entries directly to LanceDB, entirely out-of-process
     from this server -- unlike add_expert_qa_pair above, which is called from
     within a running request here. Without this endpoint, a long-running
@@ -1229,6 +1230,8 @@ async def reload_techsupport_qa_pairs(encrypted_key: str) -> dict:
         raise HTTPException(status_code=500, detail="Internal error in reload_techsupport_qa_pairs()") from exc
 
 
+# Written here by this API process. lil-lisa-cron-scripts reads the same path
+# (paths.THREAD_TAGS_PATH); do not move this file into the cron package.
 TECHSUPPORT_THREAD_TAGS_PATH = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "techsupport_thread_tags.json"
 
 
@@ -1258,11 +1261,8 @@ async def tag_techsupport_thread(thread_ts: str, related_entry_title: str, encry
     """
     try:
         _require_jwt(encrypted_key)
-        tags = {}
-        if TECHSUPPORT_THREAD_TAGS_PATH.exists():
-            tags = json.loads(TECHSUPPORT_THREAD_TAGS_PATH.read_text(encoding="utf-8"))
-        tags[thread_ts] = related_entry_title
-        TECHSUPPORT_THREAD_TAGS_PATH.write_text(json.dumps(tags, indent=2), encoding="utf-8")
+        async with THREAD_TAGS_LOCK:
+            upsert_thread_tag(thread_ts, related_entry_title, path=TECHSUPPORT_THREAD_TAGS_PATH)
         return "ok"
     except jwt.exceptions.InvalidSignatureError as e:
         raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e

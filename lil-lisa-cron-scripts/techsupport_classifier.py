@@ -40,9 +40,11 @@ import dspy
 import requests
 from dotenv import dotenv_values
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
-LILLISA_SERVER_ENV_PATH = PROJECT_ROOT / "env" / "lillisa_server.env"
+from paths import LILLISA_SERVER_ENV_PATH, LILLISA_SERVER_ROOT, PACKAGE_ROOT, ensure_import_paths
+
+ensure_import_paths()
+SCRIPT_DIR = PACKAGE_ROOT
+PROJECT_ROOT = LILLISA_SERVER_ROOT
 
 SLACK_API_BASE = "https://slack.com/api"
 IGNORED_SUBTYPES = {"channel_join", "channel_leave"}
@@ -62,10 +64,20 @@ def load_llm_env() -> Dict[str, str]:
     return env
 
 
+_dspy_configured = False
+
+
 def configure_dspy_lm() -> None:
     """Point dspy.LM at the same litellm-backed model the rest of the project
     already uses -- no new LLM provider needed, since dspy.LM uses litellm
-    internally and litellm is already a pinned dependency."""
+    internally and litellm is already a pinned dependency.
+
+    Lazy: only runs on the first classify/summarize call so importing this
+    module (or nightly_pipeline) does not require LLM key files.
+    """
+    global _dspy_configured
+    if _dspy_configured:
+        return
     env = load_llm_env()
     llm_model = env["LLM_MODEL"]
 
@@ -78,6 +90,7 @@ def configure_dspy_lm() -> None:
 
     lm = dspy.LM(model=llm_model, api_key=api_key)
     dspy.configure(lm=lm)
+    _dspy_configured = True
 
 
 # --- DSPy signatures, ported verbatim from the final version in
@@ -199,6 +212,7 @@ def classify_thread(
     already-resolved topic rather than needing to independently resolve
     something from scratch.
     """
+    configure_dspy_lm()
     conversation_thread = format_thread_messages(messages, slack_token=slack_token)
 
     useful_result = check_useful(conversation_thread=conversation_thread)
@@ -214,6 +228,3 @@ def classify_thread(
         "is_conclusive": is_conclusive,
         "conversation_thread": conversation_thread,
     }
-
-
-configure_dspy_lm()

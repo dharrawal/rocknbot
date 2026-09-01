@@ -39,9 +39,11 @@ from typing import Any, Dict, List
 import lancedb
 from dotenv import dotenv_values
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
-LILLISA_SERVER_ENV_PATH = PROJECT_ROOT / "env" / "lillisa_server.env"
+from paths import LILLISA_SERVER_ENV_PATH, LILLISA_SERVER_ROOT, PACKAGE_ROOT, ensure_import_paths
+
+ensure_import_paths()
+SCRIPT_DIR = PACKAGE_ROOT
+PROJECT_ROOT = LILLISA_SERVER_ROOT
 
 TECHSUPPORT_QA_TABLE_NAME = "TECHSUPPORT_QA_PAIRS"
 
