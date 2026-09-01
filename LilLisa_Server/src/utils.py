@@ -27,6 +27,33 @@ LILLISA_SERVER_ENV_DICT = {
 
 
 NO_ANSWER_MARKER = "[[NO_ANSWER]]"
+# Tables in qa_system_prompt.txt are already rule 10. Injected version
+# instructions must not reuse that number (pr42-mp.1.2).
+QA_VERSION_RULE_NUMBER = 11
+
+
+def append_product_version_rule(
+    qa_system_prompt: str, matched_versions: Optional[list] = None
+) -> str:
+    """Append the product-version instruction as rule 11 (not a second rule 10).
+
+    When matched_versions is non-empty, name those versions. Otherwise tell
+    the model all versions were used, and keep [[NO_ANSWER]] first if used.
+    """
+    if matched_versions:
+        versions = " and ".join(matched_versions)
+        return (
+            qa_system_prompt
+            + f"\n{QA_VERSION_RULE_NUMBER}. Mention the product version(s) you used "
+            f"to craft your response were '{versions}'"
+        )
+    return (
+        qa_system_prompt
+        + f"\n{QA_VERSION_RULE_NUMBER}. Mention that because a specific product version "
+        "was not specified, information from all available versions was used. If your "
+        f'response begins with the "{NO_ANSWER_MARKER}" marker per rule 9, that marker '
+        "must still come first, before this mention."
+    )
 
 
 def parse_leading_no_answer_marker(

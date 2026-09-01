@@ -67,6 +67,12 @@ one implementation (voyage-context-3, input_type="query", 2048 dims --
 confirmed against the actual IDA_QA_PAIRS/IDDM_QA_PAIRS tables' schema in the
 local ./lancedb), so there's no risk of the two drifting out of sync.
 
+Nightly insert embeddings use that query-space helper. Weekly
+techsupport_contextual_reembed.py re-embeds the whole markdown file with
+contextual input_type="document". Until that job runs, new rows are not in
+the same space as older re-embedded rows (pr42-mp.1.8; full fix is
+pr42-enhancements.3).
+
 Generated title/summary text is run through redact_obvious_pii() before
 markdown/LanceDB/GitHub (emails, private IPs, Slack mentions, obvious
 secrets, INC/SR/HD/TICKET ids, internal FQDNs). Hostnames, tenant names,
@@ -109,6 +115,12 @@ PROJECT_ROOT = LILLISA_SERVER_ROOT
 from github_anchor import compute_github_urls_for_titles  # noqa: E402
 from atomic_io import atomic_write_json, atomic_write_text  # noqa: E402
 from techsupport_classifier import configure_dspy_lm  # noqa: E402
+from techsupport_markdown import (  # noqa: E402
+    parse_summary_markdown,
+    prepare_title_and_summary_for_markdown,
+    sanitize_techsupport_summary,
+    sanitize_techsupport_title,
+)
 from techsupport_pii import redact_obvious_pii  # noqa: E402
 from techsupport_review_state import node_ids_from_review_entry, review_entry_state  # noqa: E402
 
@@ -191,17 +203,7 @@ def save_review_state(state: Dict[str, Any]) -> None:
     atomic_write_json(REVIEW_STATE_PATH, state)
 
 
-# --- Markdown parsing (deliberately separate from
-# _run_update_golden_qa_pairs_task's qa_pattern in src/main.py, since this
-# file has its own parser anyway -- see the FLAGGED OPEN ITEM in the module
-# docstring) ---
-
-# Splits on any line starting with "## " (the title heading marker), so the
-# entry text itself must never start a line with "## " -- true of both the
-# historical summary source data and the title-generation prompt below, so
-# this is a safe assumption rather than a real ambiguity risk.
-_TITLE_BLOCK_SPLIT_PATTERN = re.compile(r"(?m)^## ")
-_TITLE_SUMMARY_PATTERN = re.compile(r"(.+?)\n\n(.*)", re.DOTALL)
+# --- Markdown parsing (see techsupport_markdown.py) ---
 
 
 def _redact_generated_title_and_summary(title: str, summary: str) -> tuple[str, str]:
@@ -211,24 +213,6 @@ def _redact_generated_title_and_summary(title: str, summary: str) -> tuple[str, 
     if redacted_title != title or redacted_summary != summary:
         logger.info("Redacted obvious PII from generated techsupport title/summary")
     return redacted_title, redacted_summary
-
-
-def parse_summary_markdown(file_content: str) -> List[Dict[str, Any]]:
-    """Parse techsupport_qa_pairs.md into an ordered list of
-    {"title", "summary"} dicts, one per "## {title}" heading block, in file
-    order."""
-    entries = []
-    for raw_block in _TITLE_BLOCK_SPLIT_PATTERN.split(file_content):
-        block = raw_block.strip()
-        if not block:
-            continue
-        match = _TITLE_SUMMARY_PATTERN.match(block)
-        if not match:
-            continue
-        title, summary = match[1].strip(), match[2].strip()
-        if title and summary:
-            entries.append({"title": title, "summary": summary})
-    return entries
 
 
 def load_pipeline_env() -> Dict[str, str]:
@@ -252,8 +236,12 @@ _embedding_configured = False
 
 def configure_embedding_model() -> None:
     """Point Settings.embed_model at the same Voyage model/config the golden
-    QA pairs tables were built with, so new rows land in the same vector
-    space and are retrievable identically."""
+    QA pairs tables were built with.
+
+    This is query-space (`input_type="query"`). Weekly contextual reembed uses
+    document-space; new rows match retrieval until that job runs, then match
+    the rest of the techsupport table. See module docstring / pr42-mp.1.8.
+    """
     global _embedding_configured
     if _embedding_configured:
         return
@@ -346,6 +334,8 @@ def generate_verified_title_and_summary(conversation_thread: str) -> Dict[str, s
     summary = summarize_conversation(conversation_thread=conversation_thread).summary.strip()
     title = generate_title(summary=summary).title.strip()
     title, summary = _redact_generated_title_and_summary(title, summary)
+    title = sanitize_techsupport_title(title)
+    summary = sanitize_techsupport_summary(summary)
     return {"title": title, "summary": summary}
 
 
@@ -526,14 +516,19 @@ def add_verified_qa_pair(conversation_thread: str, thread_ts: Optional[str] = No
     generated = generate_verified_title_and_summary(conversation_thread)
     title, summary = generated["title"], generated["summary"]
 
+    markdown_filepath = VERIFIED_TECHSUPPORT_QA_FOLDERPATH / TECHSUPPORT_QA_MARKDOWN_FILENAME
+    existing_titles: List[str] = []
+    if markdown_filepath.exists():
+        existing_titles = [
+            entry["title"] for entry in parse_summary_markdown(markdown_filepath.read_text(encoding="utf-8"))
+        ]
+    title, summary = prepare_title_and_summary_for_markdown(title, summary, existing_titles)
+
     # The new entry's ordinal is its position in the markdown file as it
     # exists right now -- NOT len(review_state["entries"]), which would be
     # wrong (and silently misaligned forever after) if any earlier entries in
     # the file predate this feature and were never recorded in review_state.
-    markdown_filepath = VERIFIED_TECHSUPPORT_QA_FOLDERPATH / TECHSUPPORT_QA_MARKDOWN_FILENAME
-    entry_index = 0
-    if markdown_filepath.exists():
-        entry_index = len(parse_summary_markdown(markdown_filepath.read_text(encoding="utf-8")))
+    entry_index = len(existing_titles)
 
     markdown_path = append_summary_to_markdown(title, summary)
     github_url = _compute_github_url_for_entry(entry_index, markdown_path)
@@ -590,6 +585,13 @@ def replace_verified_qa_pair(thread_ts: str, conversation_thread: str) -> Dict[s
 
     generated = generate_verified_title_and_summary(conversation_thread)
     title, summary = generated["title"], generated["summary"]
+    markdown_filepath = VERIFIED_TECHSUPPORT_QA_FOLDERPATH / TECHSUPPORT_QA_MARKDOWN_FILENAME
+    existing_titles = [
+        entry["title"]
+        for i, entry in enumerate(parse_summary_markdown(markdown_filepath.read_text(encoding="utf-8")))
+        if i != entry_index
+    ]
+    title, summary = prepare_title_and_summary_for_markdown(title, summary, existing_titles)
 
     review_state = load_review_state()
     existing_entry_state = review_entry_state(review_state, entry_index)
@@ -660,6 +662,7 @@ def enrich_verified_entry(existing_title: str, new_thread_conversation: str) -> 
         existing_summary=existing_summary, new_insight=new_insight_summary
     ).merged_summary.strip()
     merged_summary = redact_obvious_pii(merged_summary)
+    merged_summary = sanitize_techsupport_summary(merged_summary)
 
     review_state = load_review_state()
     existing_entry_state = review_entry_state(review_state, entry_index)

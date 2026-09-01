@@ -108,7 +108,27 @@ def load_env() -> Dict[str, str]:
         raise RuntimeError(
             f"Missing required env var(s) {missing} - expected in {ENV_PATH}"
         )
+    assert_pipeline_matches_product_channel_ids(env)
     return env
+
+
+def assert_pipeline_matches_product_channel_ids(env: Dict[str, str]) -> None:
+    """If product-specific channel IDs are present, they must equal TECHSUPPORT_CHANNEL_ID."""
+    canonical = env["TECHSUPPORT_CHANNEL_ID"]
+    mismatched = {
+        key: env[key]
+        for key in (
+            "TECHSUPPORT_CHANNEL_ID_IDA",
+            "TECHSUPPORT_CHANNEL_ID_IDDM",
+            "TECHSUPPORT_CHANNEL_ID_IDO",
+        )
+        if env.get(key) and env[key] != canonical
+    }
+    if mismatched:
+        raise RuntimeError(
+            "TECHSUPPORT_CHANNEL_ID_IDA/_IDDM/_IDO must equal TECHSUPPORT_CHANNEL_ID "
+            f"({canonical!r}); mismatched: {mismatched}"
+        )
 
 
 def _pipeline_env() -> Dict[str, str]:

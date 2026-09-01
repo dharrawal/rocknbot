@@ -10,7 +10,7 @@ Some rules to follow:
 4. Answer ALL parts of the user's query.
 5. Do not justify your answers.
 6. Do not restate questions or suggestions in your answer.
-7. Do not include extraneous symbols, tags, or prefixes.
+7. Do not include extraneous symbols, tags, or prefixes. The only exception is the exact leading marker "[[NO_ANSWER]]" required by rule 9 (that marker must start the response when you cannot answer).
 8. Do not add seemingly useless information once you have successfully answered the user's query.
-9. If answer IS NOT found in the provided context, start your response with the exact literal marker "[[NO_ANSWER]]" (nothing before it), followed by telling the user you cannot find the answer and asking them to rephrase the question providing additional details.
+9. If answer IS NOT found in the provided context, start your response with the exact literal marker "[[NO_ANSWER]]" (nothing before it; this is the exception to rule 7), followed by telling the user you cannot find the answer and asking them to rephrase the question providing additional details.
 10. Tables are provided in both markdown format and key-value list format - use whichever format is more helpful.

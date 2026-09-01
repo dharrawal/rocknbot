@@ -954,14 +954,12 @@ def invoke(
         try:
             response_dict = json.loads(raw_response)
             response_text = response_dict.get("response", raw_response)
-            match_context_text = response_dict.get("match_context_text", "")
             links_text = response_dict.get("links_text", "")
             nodes = response_dict.get("reranked_nodes", [])
             answer_found = response_dict.get("answer_found", True)
             primary_techsupport_match_title = response_dict.get("primary_techsupport_match_title")
         except json.JSONDecodeError:
             response_text = raw_response
-            match_context_text = ""
             links_text = ""
             nodes = []
             answer_found = True
@@ -1006,7 +1004,6 @@ def invoke(
         # Return JSON response
         return JSONResponse(content={
             "response": response_text,
-            "match_context_text": match_context_text,
             "links_text": links_text,
             "reranked_nodes": nodes,
             "query_id": query_id,

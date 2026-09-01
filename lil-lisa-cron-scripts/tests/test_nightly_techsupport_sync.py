@@ -198,5 +198,25 @@ class SyncHybridTests(unittest.TestCase):
         self.assertEqual(saved["threads"]["cold"]["last_seen_reply_ts"], str(now - 120 * day))
 
 
+class PipelineChannelIdAssertTests(unittest.TestCase):
+    def test_matching_optional_ids_ok(self):
+        sync_mod.assert_pipeline_matches_product_channel_ids(
+            {
+                "TECHSUPPORT_CHANNEL_ID": "Cshared",
+                "TECHSUPPORT_CHANNEL_ID_IDA": "Cshared",
+                "TECHSUPPORT_CHANNEL_ID_IDDM": "Cshared",
+            }
+        )
+
+    def test_mismatch_raises(self):
+        with self.assertRaises(RuntimeError):
+            sync_mod.assert_pipeline_matches_product_channel_ids(
+                {
+                    "TECHSUPPORT_CHANNEL_ID": "Cshared",
+                    "TECHSUPPORT_CHANNEL_ID_IDA": "Cother",
+                }
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

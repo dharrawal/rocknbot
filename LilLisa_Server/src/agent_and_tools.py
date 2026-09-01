@@ -517,6 +517,9 @@ def answer_from_document_retrieval(
         if IDDM_INDEX is None or IDDM_QA_PAIRS_INDEX is None:
             elapsed = time.perf_counter() - t0_total
             utils.logger.debug("PERF | answer_from_document_retrieval_total | %.3fs", elapsed)
+            # answer_found True is intentional (pr42-mp.1.3): this is an infra
+            # failure, not a product no-answer. Slack hides escalate so we do
+            # not page tech support for a down bot; users contact an admin.
             return json.dumps({"response": "IDDM indices are not initialized. The server may have encountered an error during startup. Please contact an administrator.", "reranked_nodes": [], "answer_found": True})
         product_versions = IDDM_PRODUCT_VERSIONS
         version_pattern = re.compile(r"v?\d+\.\d+", re.IGNORECASE)
@@ -529,6 +532,8 @@ def answer_from_document_retrieval(
         if IDO_INDEX is None or IDO_QA_PAIRS_INDEX is None:
             elapsed = time.perf_counter() - t0_total
             utils.logger.debug("PERF | answer_from_document_retrieval_total | %.3fs", elapsed)
+            # answer_found True is intentional (pr42-mp.1.3): IDO not configured
+            # is not a product question for tech support. Slack hides escalate.
             return json.dumps({"response": "IDO product is not configured on this server. Please contact an administrator.", "reranked_nodes": [], "answer_found": True})
         product_versions = IDO_PRODUCT_VERSIONS
         version_pattern = re.compile(r"\b(?:dev/)?v?\d+\.\d+\b", re.IGNORECASE)
@@ -540,6 +545,9 @@ def answer_from_document_retrieval(
         if IDA_INDEX is None or IDA_QA_PAIRS_INDEX is None:
             elapsed = time.perf_counter() - t0_total
             utils.logger.debug("PERF | answer_from_document_retrieval_total | %.3fs", elapsed)
+            # answer_found True is intentional (pr42-mp.1.3): this is an infra
+            # failure, not a product no-answer. Slack hides escalate so we do
+            # not page tech support for a down bot; users contact an admin.
             return json.dumps({"response": "IDA indices are not initialized. The server may have encountered an error during startup. Please contact an administrator.", "reranked_nodes": [], "answer_found": True})
         product_versions = IDA_PRODUCT_VERSIONS
         version_pattern = re.compile(r"\b(?:IAP[- ]\d+\.\d+|version[- ]\d+\.\d+|descartes(?:-dev)?)\b", re.IGNORECASE)
@@ -551,7 +559,7 @@ def answer_from_document_retrieval(
     if matched_versions := get_matching_versions(
         original_query, product_versions, version_pattern
     ):
-        qa_system_prompt += f"\n10. Mention the product version(s) you used to craft your response were '{' and '.join(matched_versions)}'"
+        qa_system_prompt = utils.append_product_version_rule(qa_system_prompt, matched_versions)
         lance_filter_documents = " OR ".join(f"(metadata.version = '{version}')" for version in matched_versions)
         lance_filter_qa_pairs = (
             f"(metadata.version = 'none') OR {lance_filter_documents}"
@@ -563,7 +571,7 @@ def answer_from_document_retrieval(
             vector_store_kwargs={"where": lance_filter_qa_pairs}, similarity_top_k=8
         )
     else:
-        qa_system_prompt += "\n10. Mention that because a specific product version was not specified, information from all available versions was used. If your response begins with the \"[[NO_ANSWER]]\" marker per rule 9, that marker must still come first, before this mention."
+        qa_system_prompt = utils.append_product_version_rule(qa_system_prompt, None)
         # Create fresh retrievers (not global defaults) so we can set cached embed model
         document_retriever = document_index.as_retriever(similarity_top_k=50)
         qa_pairs_retriever = qa_pairs_index.as_retriever(similarity_top_k=8)

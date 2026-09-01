@@ -23,7 +23,7 @@ This adds two things to Rocknbot. First, a real-time escalation flow that lets L
 | Variable | Purpose |
 | :---- | :---- |
 | `SLACK_BOT_TOKEN` | Bot token used by the standalone nightly scripts to read the tech support channel. Same bot as `lil-lisa`'s. |
-| `TECHSUPPORT_CHANNEL_ID` | The real tech support channel ID. |
+| `TECHSUPPORT_CHANNEL_ID` | The real tech support channel ID. **Must equal** `lil-lisa`'s `TECHSUPPORT_CHANNEL_ID_IDA` / `_IDDM` / `_IDO` (those three must all be the same ID; the bot raises at startup if they disagree). If you also copy the product-specific names into this file, the pipeline refuses to start when they differ from `TECHSUPPORT_CHANNEL_ID`. |
 | `ADMIN_CHANNEL_ID` | Where pipeline error notifications get posted. |
 
 This is a separate env file from `lil-lisa`'s on purpose, so the nightly scripts can run standalone (for example as their own cron job) without depending on `lil-lisa`'s directory or config existing.
@@ -40,7 +40,10 @@ This is a separate env file from `lil-lisa`'s on purpose, so the nightly scripts
 | Variable | Purpose |
 | :---- | :---- |
 | `TECHSUPPORT_CHANNEL_ID_IDA` | Tech support channel for IDA. |
-| `TECHSUPPORT_CHANNEL_ID_IDDM` | Tech support channel for IDDM. In production these should both point to the same real channel, since there's only one shared tech support channel, not one per product (confirmed during this project). |
+| `TECHSUPPORT_CHANNEL_ID_IDDM` | Tech support channel for IDDM. |
+| `TECHSUPPORT_CHANNEL_ID_IDO` | Tech support channel for IDO (optional product). |
+
+In production these must all point to the **same** real channel (one shared tech support channel, not one per product). The bot asserts that at startup. Cron watches only `TECHSUPPORT_CHANNEL_ID` in `techsupport_sync.env`; set that to the same ID.
 
 **Important existing variable:** `MAX_LENGTH`: must be 3000 or less, since that's Slack's hard limit on message length. A backup check also exists in case this is ever misconfigured.
 
@@ -77,6 +80,12 @@ If Lil Lisa answers a question by citing an existing verified techsupport entry,
 2. If the user escalates, this gets recorded server-side through a new endpoint, `/tag_techsupport_thread/` on `LilLisa_Server`, following the same pattern as `/record_endorsement/`, and tracked in `techsupport_thread_tags.json`.  
 3. When the nightly pipeline later processes that escalation thread, if it's tagged this way, it uses a lighter classification bar. It just needs to be useful, not necessarily fully conclusive on its own, since the point isn't to independently resolve a new question but to add supplementary insight to something already resolved.  
 4. If it passes, the existing entry's content gets updated through an LLM merge call, but its title never changes. That's what keeps the entry's GitHub link stable even as its content grows over time.
+
+### 4b. Embedding space until weekly reembed (ops)
+
+Nightly `add` / `replace` / `enrich` embed each new row with Voyage `input_type="query"` (the same helper retrieval uses). `techsupport_contextual_reembed.py` (default every `TECHSUPPORT_REEMBED_INTERVAL_DAYS` days) re-embeds the **whole** `techsupport_qa_pairs.md` with contextual `input_type="document"`.
+
+Until that weekly job runs, **new rows live in a different vector space** than rows last written by reembed. They are still searchable against user queries (query-to-query), but they may rank oddly next to older document-space rows. If a brand-new verified answer seems missing or weak in Slack, wait for the next reembed (or run `techsupport_contextual_reembed.py` once). Matching insert embeddings to the weekly job is follow-on work (`pr42-enhancements.3`).
 
 ## 5\. Cron Setup
 

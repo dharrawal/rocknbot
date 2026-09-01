@@ -28,7 +28,12 @@ from escalation_tracker import (
     hydrate_endorsement_tracker,
     is_escalation_active,
 )
-from utils import logger, parse_get_ans_result
+from utils import (
+    assert_shared_techsupport_channel_ids,
+    build_escalation_button_value,
+    logger,
+    parse_get_ans_result,
+)
 
 lil_lisa_env = dotenv_values("./app_envfiles/lil-lisa.env")
 
@@ -61,6 +66,18 @@ if not TECHSUPPORT_CHANNEL_ID_IDDM or not TECHSUPPORT_CHANNEL_ID_IDA:
         "TECHSUPPORT_CHANNEL_ID_IDDM/TECHSUPPORT_CHANNEL_ID_IDA not found in lil-lisa.env — "
         "escalate-to-techsupport button will be omitted for those products"
     )
+if not TECHSUPPORT_CHANNEL_ID_IDO:
+    logger.warning(
+        "TECHSUPPORT_CHANNEL_ID_IDO not found in lil-lisa.env — "
+        "escalate-to-techsupport button will be omitted for IDO"
+    )
+assert_shared_techsupport_channel_ids(
+    {
+        "IDA": TECHSUPPORT_CHANNEL_ID_IDA,
+        "IDDM": TECHSUPPORT_CHANNEL_ID_IDDM,
+        "IDO": TECHSUPPORT_CHANNEL_ID_IDO,
+    }
+)
 EXPERT_USER_ID_IDA = lil_lisa_env["EXPERT_USER_ID_IDA"]
 EXPERT_USER_ID_IDDM = lil_lisa_env["EXPERT_USER_ID_IDDM"]
 AUTHENTICATION_KEY = lil_lisa_env["AUTHENTICATION_KEY"]
@@ -86,8 +103,6 @@ async def _requests_call(func, *args, **kwargs):
 BOT_USER_ID: str = None
 RERANK_CACHE: Dict[str, List[Dict[str, str]]] = {}
 ESCALATE_ACTION_ID = "escalate_to_techsupport"
-# Slack block "value" fields are capped at 2000 chars; leave room for the JSON envelope.
-ESCALATE_VALUE_QUERY_MAX_LENGTH = 1500
 # Dictionary to track which message threads have already been endorsed or escalated
 # Format: {conv_id: {"message_endorsed": True/False, "reaction_endorsed": "up"/"down"/False, "escalated": True/False}}
 # Thumbs stay in process memory. Successful escalations are also persisted
@@ -101,25 +116,8 @@ ESCALATE_NOTE_TEXT = (
     "and complete, press the button below to post your question in the tech support channel."
 )
 ESCALATE_ALREADY_POSTED_TEXT = "Already posted to tech support."
+TS_CHANNEL_MENTION_REPLY = "Ask in the relevant product channel, not here."
 ESCALATION_BLOCK_IDS = frozenset({"escalation_note", "escalation_actions"})
-
-
-def build_escalation_button_value(
-    query: str, channel_id: str, thread_ts: str, session_id, user_id: str,
-    primary_techsupport_match_title: str = None,
-) -> str:
-    """Encode everything the escalate button click handler needs to re-derive the original
-    question, who asked it, and where to reply."""
-    value = {
-        "query": query[:ESCALATE_VALUE_QUERY_MAX_LENGTH],
-        "channel_id": channel_id,
-        "thread_ts": thread_ts,
-        "session_id": str(session_id),
-        "user_id": user_id,
-    }
-    if primary_techsupport_match_title:
-        value["primary_techsupport_match_title"] = primary_techsupport_match_title
-    return json.dumps(value)
 
 
 def build_escalation_blocks(button_value: str, prominent: bool) -> List[Dict[str, Any]]:
@@ -462,7 +460,8 @@ async def handle_message_events(event, say):
     }
     if channel_id in techsupport_channel_ids:
         if LIL_LISA_SLACK_USERID in event.get("text", ""):
-            await process_msg(event, say)
+            thread_ts = event.get("thread_ts") or event.get("ts")
+            await say(text=TS_CHANNEL_MENTION_REPLY, thread_ts=thread_ts)
         return
 
     # Process message if bot was mentioned OR thread has < 3 participants
@@ -946,6 +945,7 @@ async def handle_escalate_to_techsupport(ack, body, client):
     session_id = payload.get("session_id")
     asker_user_id = payload.get("user_id")
     related_entry_title = payload.get("primary_techsupport_match_title")
+    clicker_user_id = (body.get("user") or {}).get("id")
 
     logger.info(
         f"[ESCALATE CLICK] session_id={session_id!r} query_chars={len(query)} "
@@ -1049,8 +1049,12 @@ async def handle_escalate_to_techsupport(ack, body, client):
     channel_link_text = orig_channel_name or "here"
     channel_ref = f"<{orig_permalink}|{channel_link_text}>" if orig_permalink else channel_link_text
     asker_ref = f"<@{asker_user_id}>" if asker_user_id else "Someone"
+    clicker_ref = f"<@{clicker_user_id}>" if clicker_user_id else "someone"
 
-    techsupport_note = f"Question posted in {channel_ref}. {asker_ref} dissatisfied with answer and requests help."
+    techsupport_note = (
+        f"Question posted in {channel_ref}. {asker_ref} dissatisfied with answer and requests help. "
+        f"Clicked by {clicker_ref}."
+    )
     techsupport_fallback_text = (
         f"Question posted in {orig_channel_name or orig_channel_id}. {escalation_query}"
     )

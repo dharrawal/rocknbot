@@ -51,17 +51,9 @@ Required env vars: same as techsupport_qa_ingest.py / techsupport_classifier.py
 (read from ../env/lillisa_server.env) -- LLM_MODEL, LLM_API_KEY_FILEPATH,
 LANCEDB_FOLDERPATH, VOYAGE_API_KEY_FILEPATH.
 
-Usage:
-    # Dry run: parse + extract only, print results, touch nothing on disk.
-    python historical_import.py --dry-run --limit 10 --files summary_part_1.txt
-
-    # Real run against everything not yet processed, resumable:
-    python historical_import.py
-
-    # Real run without the final reembed (e.g. to split "convert" and
-    # "reembed" into separate invocations):
-    python historical_import.py --skip-reembed
-    python historical_import.py --reembed-only
+Usage: this script is retired. Running it exits with an error. See
+historical_import_production.py for a one-shot production import, or
+nightly_pipeline.py for ongoing ingest.
 """
 
 import argparse
@@ -72,6 +64,22 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+HISTORICAL_IMPORT_RETIRED_MESSAGE = (
+    "historical_import.py is retired and must not be run. "
+    "It still extracts (question, answer) pairs and would corrupt the current "
+    "prose techsupport_qa_pairs.md. Use historical_import_production.py for a "
+    "one-shot production import, or nightly_pipeline.py for ongoing ingest."
+)
+
+
+def main() -> None:
+    print(HISTORICAL_IMPORT_RETIRED_MESSAGE, file=sys.stderr)
+    raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()
 
 import dspy
 
@@ -351,25 +359,8 @@ def print_summary(result: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--files", nargs="*", default=None, help="Restrict to these source filenames (e.g. summary_part_1.txt)")
-    parser.add_argument("--limit", type=int, default=None, help="Max number of not-yet-done entries to process this run")
-    parser.add_argument("--dry-run", action="store_true", help="Extract and print only; write nothing to disk")
-    parser.add_argument("--skip-reembed", action="store_true", help="Skip the final full contextual re-embed step")
-    parser.add_argument("--reembed-only", action="store_true", help="Skip parsing/conversion; just force a full re-embed now")
-    args = parser.parse_args()
-
-    if args.reembed_only:
-        print("Triggering full contextual re-embed of TECHSUPPORT_QA_PAIRS ...")
-        reembed_result = techsupport_contextual_reembed.run_reembed()
-        reembed_state = techsupport_contextual_reembed.load_state()
-        reembed_state["last_reembed_timestamp"] = f"{time.time():.6f}"
-        techsupport_contextual_reembed.save_state(reembed_state)
-        print(f"Reembed done: {reembed_result}")
-        return
-
-    result = run(files=args.files, limit=args.limit, dry_run=args.dry_run, skip_reembed=args.skip_reembed)
-    print_summary(result)
+    print(HISTORICAL_IMPORT_RETIRED_MESSAGE, file=sys.stderr)
+    raise SystemExit(2)
 
 
 if __name__ == "__main__":

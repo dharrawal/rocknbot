@@ -34,6 +34,55 @@ def parse_get_ans_result(raw_result: str) -> Dict[str, Any]:
     return parsed
 
 
+SLACK_ACTION_VALUE_MAX = 2000
+ESCALATE_VALUE_QUERY_MAX_LENGTH = 1500
+
+
+def build_escalation_button_value(
+    query: str,
+    channel_id: str,
+    thread_ts: str,
+    session_id,
+    user_id: str,
+    primary_techsupport_match_title: str = None,
+) -> str:
+    """Encode escalate-button state. Slack action `value` is capped at 2000 chars."""
+    value: Dict[str, Any] = {
+        "query": query[:ESCALATE_VALUE_QUERY_MAX_LENGTH],
+        "channel_id": channel_id,
+        "thread_ts": thread_ts,
+        "session_id": str(session_id),
+        "user_id": user_id,
+    }
+    encoded = json.dumps(value)
+    if not primary_techsupport_match_title:
+        return encoded
+    title = primary_techsupport_match_title
+    while True:
+        candidate = dict(value)
+        candidate["primary_techsupport_match_title"] = title
+        blob = json.dumps(candidate)
+        if len(blob) <= SLACK_ACTION_VALUE_MAX:
+            return blob
+        if len(title) <= 1:
+            return encoded
+        title = title[: max(0, len(title) - 32)]
+
+
+def assert_shared_techsupport_channel_ids(product_channels: Dict[str, Optional[str]]) -> None:
+    """Production uses one shared tech-support channel for IDA/IDDM/IDO.
+
+    Configured (non-empty) IDs must all be equal. Unset products are ignored.
+    """
+    nonempty = {name: channel_id for name, channel_id in product_channels.items() if channel_id}
+    unique = set(nonempty.values())
+    if len(unique) > 1:
+        raise ValueError(
+            "TECHSUPPORT_CHANNEL_ID_IDA / _IDDM / _IDO must all be the same shared "
+            f"channel; got {nonempty}"
+        )
+
+
 def get_env_variable(var_name: str, default: Optional[str] = None) -> str:
     """
     Helper function to get the environment variable or raise exception.
