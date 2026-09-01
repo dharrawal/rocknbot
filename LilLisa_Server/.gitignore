@@ -39,8 +39,7 @@ lancedb/*/_indices
 # Ignore passwords
 passwords/
 
-# Ignore production Slack harvest test-pull output
-data/historical_import/production_test_pull*.txt
-
-# Ignore test-workspace Slack harvest pull output
-data/historical_import/test_harvest_pull*.txt
+# Ignore local Slack harvest dumps under data/historical_import/
+# Keep .gitkeep so the empty directory exists for scripts that assume the path.
+data/historical_import/*
+!data/historical_import/.gitkeep

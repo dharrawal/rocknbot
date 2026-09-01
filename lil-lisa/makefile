@@ -10,6 +10,8 @@ TAG=2.3.2
 
 .EXPORT_ALL_VARIABLES:
 
+# Optional so make works without env; copy from *.example before deploy/run.
+# Keep examples as unquoted KEY=value, no export, no inline comments (Make include ≠ python-dotenv).
 -include ./app_envfiles/${IMAGE}.env
 
 _wait30s:

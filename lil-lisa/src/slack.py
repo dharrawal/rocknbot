@@ -34,6 +34,7 @@ from utils import (
     logger,
     parse_get_ans_result,
     truncate_preserving_code_fences,
+    warn_if_escalate_body_channel_mismatch,
 )
 
 lil_lisa_env = dotenv_values("./app_envfiles/lil-lisa.env")
@@ -113,8 +114,7 @@ hydrate_endorsement_tracker(ENDORSEMENT_TRACKER)
 
 ESCALATE_BUTTON_TEXT = "Post question in tech support channel"
 ESCALATE_NOTE_TEXT = (
-    "If you are not satisfied with the answer and confident that your question is clear "
-    "and complete, press the button below to post your question in the tech support channel."
+    "If this didn't help and your question is complete, post it to tech support."
 )
 ESCALATE_ALREADY_POSTED_TEXT = "Already posted to tech support."
 TS_CHANNEL_MENTION_REPLY = "Ask in the relevant product channel, not here."
@@ -968,6 +968,8 @@ async def handle_escalate_to_techsupport(ack, body, client):
     if not orig_channel_id or not orig_thread_ts:
         logger.error(f"[ESCALATE] Missing channel_id/thread_ts in button value: {payload}")
         return
+
+    warn_if_escalate_body_channel_mismatch(body, orig_channel_id)
 
     product, _ = determine_product_and_expert(orig_channel_id)
     techsupport_channel_id = get_techsupport_channel(product)

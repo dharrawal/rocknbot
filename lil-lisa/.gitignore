@@ -10,9 +10,6 @@
 app_envfiles/*
 !app_envfiles/*.example
 
-# Ignore tool-specific credential env files (e.g. production harvest tokens)
-tools/env/
-
 # Ignore Docker ignore files
 .dockerignore
 

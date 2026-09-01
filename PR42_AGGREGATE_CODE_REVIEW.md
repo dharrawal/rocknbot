@@ -324,103 +324,160 @@ None identified at medium severity.
 
 ---
 
-## 4. Low Pri (`pr42-lp`)
+## 4. Low Pri (`pr42-lp`) — **closed** (all children closed)
 
 Worth doing; not merge-blocking.
 
-### FEATURE (`pr42-lp.1`)
+### FEATURE (`pr42-lp.1`) — **closed** (3/3 children closed)
 
 **IDO techsupport channel is easy to omit** (`pr42-lp.1.1`)  
 `lil-lisa.env.example` has `TECHSUPPORT_CHANNEL_ID_IDA` / `_IDDM` but omits `_IDO` even in the IDO optional block. The bot also only warns when IDA/IDDM are unset, not IDO. Easy to deploy IDA/IDDM escalation and forget IDO.
 
+- **Done:** Commented `TECHSUPPORT_CHANNEL_ID_IDO` in the IDO optional block of `lil-lisa/app_envfiles/lil-lisa.env.example`; comment notes it must equal the IDA/IDDM channel IDs. IDO stays optional.
+- **Beads:** `pr42-lp.1.1` **closed**.
+
 `**lillisa_server.env.example` omits `LIL_LISA_SERVER_URL**` (`pr42-lp.1.2`)  
 `nightly_pipeline.reload_techsupport_index()` reads it (default `http://127.0.0.1:8000`). Cron on another host will silently hit localhost.
+
+- **Done:** Added `LIL_LISA_SERVER_URL=http://127.0.0.1:8000` to `LilLisa_Server/env/lillisa_server.env.example` with a comment that cron should override if it does not share a host with the API.
+- **Beads:** `pr42-lp.1.2` **closed**.
 
 `**tools/env/` has no references in this PR’s code** (`pr42-lp.1.3`)  
 Harmless if you have local harvest tools; otherwise it is a dead ignore. Short comment or drop it.
 
-### SECURITY (`pr42-lp.2`)
+- **Done:** Removed unused `tools/env/` ignore from `lil-lisa/.gitignore`.
+- **Beads:** `pr42-lp.1.3` **closed**. Parent FEATURE epic `pr42-lp.1` **closed**.
+
+### SECURITY (`pr42-lp.2`) — **closed** (3/3 children closed)
 
 **Harvest dump gitignore is name-specific** (`pr42-lp.2.1`)  
 `production_test_pull*.txt` / `test_harvest_pull*.txt` only. A differently named dump under `data/historical_import/` would be committable Slack data. Ignoring `data/historical_import/` (and tracking examples elsewhere) is safer if that directory is only for local harvest output.
 
+- **Done:** `LilLisa_Server/.gitignore` ignores `data/historical_import/*` and un-ignores `.gitkeep` so the empty directory stays in git.
+- **Beads:** `pr42-lp.2.1` **closed**.
+
 `**GITHUB_TOKEN=ghp_your-personal-access-token-here` looks like a real PAT prefix** (`pr42-lp.2.2`)  
 Some scanners flag `ghp_`. Use `GITHUB_TOKEN=` plus a comment.
+
+- **Done:** `lil-lisa-cron-scripts/env/github_push.env.example` uses empty `GITHUB_TOKEN=` plus a header comment. No `ghp_` prefix.
+- **Beads:** `pr42-lp.2.2` **closed**.
 
 `**AUTHENTICATION_KEY` / `JWT_SECRET_KEY` in the server example** (`pr42-lp.2.3`)  
 Expected placeholders; confirm this file is never used as a real env (gitignore of `env/*` with `!*.example` is correct).
 
-### PERFORMANCE (`pr42-lp.3`)
+- **Done:** Header comment on `LilLisa_Server/env/lillisa_server.env.example`: copy to gitignored `lillisa_server.env`; never put real secrets in `*.example`.
+- **Beads:** `pr42-lp.2.3` **closed**. Parent SECURITY epic `pr42-lp.2` **closed**.
+
+### PERFORMANCE (`pr42-lp.3`) — **closed** (no children)
 
 None identified at low severity.
 
-### RELIABILITY (`pr42-lp.4`)
+### RELIABILITY (`pr42-lp.4`) — **closed** (3/3 children closed)
 
 **Silent miss on optional Makefile env include** (`pr42-lp.4.1`)  
 `-include` will not warn if someone expected `./env/lillisa_server.env` (or lil-lisa’s `app_envfiles/${IMAGE}.env`) and forgot to copy from `.env.example`. A one-line comment above the include would help.
 
+- **Done:** Comments above `-include` in `LilLisa_Server/makefile` and `lil-lisa/makefile`: optional so make works without env; copy from `*.example` before deploy/run; examples stay unquoted `KEY=value` (Make include ≠ python-dotenv).
+- **Beads:** `pr42-lp.4.1` **closed**.
+
 **Rollback does not restore markdown or `review_state`** (`pr42-lp.4.2`)  
 Rolling LanceDB back without the file will drift. Document “restore md + state + table together.”
+
+- **Done:** Module docs plus `_print_coordinated_restore_reminder()` after `rollback_to_version()` in `techsupport_rollback.py`. Script does not auto-restore markdown or `review_state`; it prints the files to restore with LanceDB.
+- **Beads:** `pr42-lp.4.2` **closed**.
 
 **Classifier `Literal["yes", "no"]` equality is brittle** (`pr42-lp.4.3`)  
 If the model returns `Yes` / `yes.`, comparison fails. Normalize.
 
-### INSTRUMENTATION (`pr42-lp.5`)
+- **Done:** `is_yes_answer()` in `techsupport_classifier.py` treats yes/no case-insensitively (punctuation stripped); unknown stays `False`. Tests: `lil-lisa-cron-scripts/tests/test_techsupport_classifier_yes_no.py`.
+- **Beads:** `pr42-lp.4.3` **closed**. Parent RELIABILITY epic `pr42-lp.4` **closed**.
+
+### INSTRUMENTATION (`pr42-lp.5`) — **closed** (no children)
 
 None beyond the IDO-missing-warn aspect of the Feature item above.
 
-### MISC (`pr42-lp.6`)
+### MISC (`pr42-lp.6`) — **closed** (3/3 children closed)
 
 **One gitignore line per state filename will keep growing** (`pr42-lp.6.1`)  
 A pattern such as `scripts/*_state.json` plus an explicit `techsupport_thread_tags.json` would absorb later state files automatically.
 
+- **Done:** `lil-lisa-cron-scripts/.gitignore` uses `*_state.json`. Thread tags stay name-specific on the server (`LilLisa_Server/scripts/techsupport_thread_tags.json`).
+- **Beads:** `pr42-lp.6.1` **closed**.
+
 **Inconsistent `KEY = value` vs `KEY=value` in examples** (`pr42-lp.6.2`)  
 Harmless for python-dotenv; slightly annoying to copy.
+
+- **Done:** Tracked env examples normalized to `KEY=value`. Live env files not touched.
+- **Beads:** `pr42-lp.6.2` **closed**.
 
 **One-shot scripts in the default mental model** (`pr42-lp.6.3`)  
 `backfill_github_urls.py` / `historical_import_production.py` should stay out of the default cron (README/makefile target that is *not* `nightly_pipeline`).
 
+- **Done:** Deploy notes §4 and `lil-lisa-cron-scripts/makefile`: `run-nightly` is the only cron target; historical import and GitHub URL backfill are optional one-shot make targets, never cron.
+- **Beads:** `pr42-lp.6.3` **closed**. Parent MISC epic `pr42-lp.6` **closed**. Parent epic `pr42-lp` **closed**.
+
 ---
 
-## 5. Nits (`pr42-nits`)
+## 5. Nits (`pr42-nits`) — **closed** (all children closed)
 
 Non-blocking polish.
 
-### FEATURE (`pr42-nits.1`)
+### FEATURE (`pr42-nits.1`) — **closed** (2/2 children closed)
 
 `**ESCALATE_NOTE_TEXT` is a bit legalistic** (`pr42-nits.1.1`)  
 Fine for v1.
 
+- **Done:** Plainer copy: “If this didn't help and your question is complete, post it to tech support.” Completeness caution kept.
+- **Beads:** `pr42-nits.1.1` **closed**.
+
 `**qa_system_prompt.txt` still has no trailing newline** (`pr42-nits.1.2`)
 
-### SECURITY (`pr42-nits.2`)
+- **Done:** Trailing newline on `LilLisa_Server/data/prompts/qa_system_prompt.txt`.
+- **Beads:** `pr42-nits.1.2` **closed**. Parent FEATURE epic `pr42-nits.1` **closed**.
+
+### SECURITY (`pr42-nits.2`) — **closed** (1/1 children closed)
 
 **Make `include` ≠ dotenv** (`pr42-nits.2.1`)  
 `KEY=value` works; quoted values, `export`, and inline comments may not match how the Python app loads the same file. Already true of these `-include`s; no Makefile change required for that alone.
 
-### PERFORMANCE (`pr42-nits.3`)
+- **Done:** Documented on the Makefile `-include` comments (same as `pr42-lp.4.1`): keep examples as unquoted `KEY=value`, no `export`, no inline comments.
+- **Beads:** `pr42-nits.2.1` **closed**. Parent SECURITY epic `pr42-nits.2` **closed**.
+
+### PERFORMANCE (`pr42-nits.3`) — **closed** (no children)
 
 None.
 
-### RELIABILITY (`pr42-nits.4`)
+### RELIABILITY (`pr42-nits.4`) — **closed** (3/3 children closed)
 
 `**handle_escalate_to_techsupport` channel id sources may diverge** (`pr42-nits.4.1`)  
 Uses `body["channel"]["id"]` for `chat_update` but `orig_channel_id` from the payload for posts — usually the same; if a message is forwarded, maybe not.
 
+- **Done:** Still uses payload `channel_id` for chat_update/posts. `warn_if_escalate_body_channel_mismatch` logs when `body.channel.id` differs. Tests in `lil-lisa/tests/test_escalation_button_value.py`.
+- **Beads:** `pr42-nits.4.1` **closed**.
+
 **Duplicate retriever globals** (`pr42-nits.4.2`)  
 `TECHSUPPORT_QA_PAIRS_RETRIEVER = None` declared twice (same pre-existing pattern for other retrievers).
+
+- **Done:** Removed the duplicate `TECHSUPPORT_QA_PAIRS_RETRIEVER = None` in `LilLisa_Server/src/agent_and_tools.py`. Other retrievers still use the pre-existing double-declare pattern.
+- **Beads:** `pr42-nits.4.2` **closed**.
 
 `**except Warning` around retrieve is odd** (`pr42-nits.4.3`)  
 `Warning` is an `Exception`. Pre-existing for docs; copied for techsupport.
 
-### INSTRUMENTATION (`pr42-nits.5`)
+- **Done:** Techsupport retrieve catches `Exception` and fail-closes (empty results + `logger.exception`). Docs retrieve still has the pre-existing `except Warning`.
+- **Beads:** `pr42-nits.4.3` **closed**. Parent RELIABILITY epic `pr42-nits.4` **closed**.
+
+### INSTRUMENTATION (`pr42-nits.5`) — **closed** (no children)
 
 None beyond items already listed at Low/High.
 
-### MISC (`pr42-nits.6`)
+### MISC (`pr42-nits.6`) — **closed** (1/1 children closed)
 
 `**GithubAnchorSlugger` increment-from-zero** (`pr42-nits.6.1`)  
 Stores `result` with count `0` then increments `base`. Worth a unit test against github-slugger fixtures (some live README checks were done; encode those as tests).
+
+- **Done:** Algorithm unchanged. Unit tests in `lil-lisa-cron-scripts/tests/test_github_anchor.py`.
+- **Beads:** `pr42-nits.6.1` **closed**. Parent MISC epic `pr42-nits.6` **closed**. Parent epic `pr42-nits` **closed**.
 
 ---
 

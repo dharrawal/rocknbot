@@ -35,7 +35,6 @@ IDA_RETRIEVER = None
 IDDM_QA_PAIRS_RETRIEVER = None
 IDA_QA_PAIRS_RETRIEVER = None
 IDO_QA_PAIRS_RETRIEVER = None
-TECHSUPPORT_QA_PAIRS_RETRIEVER = None
 if torch.cuda.is_available():
     _reranker_device = "cuda"
     logging.info("Reranker using GPU (CUDA): %s", torch.cuda.get_device_name(0))
@@ -608,9 +607,6 @@ def answer_from_document_retrieval(
             result = techsupport_qa_pairs_retriever.retrieve(query)
             utils.logger.debug("PERF | retrieve_techsupport_qa_pairs | %.3fs", time.perf_counter() - t0)
             return result
-        except Warning:
-            utils.logger.debug("PERF | retrieve_techsupport_qa_pairs | %.3fs", time.perf_counter() - t0)
-            return []
         except Exception:
             # Fail closed (no techsupport results) rather than crashing the whole
             # answer if the shared techsupport table is unavailable or misconfigured.

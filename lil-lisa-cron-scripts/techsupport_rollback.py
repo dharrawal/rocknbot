@@ -11,6 +11,20 @@ rename, which means LanceDB keeps every prior version of the table on disk
 This script is a thin, explicit wrapper around that so someone can inspect
 and roll back the table by hand without knowing the LanceDB API.
 
+Coordinated restore (do not skip):
+    Rolling back TECHSUPPORT_QA_PAIRS alone will drift from the verified
+    markdown source and from techsupport_review_state.json (node_ids /
+    thread_ts keyed by markdown entry index). Those three artifacts must
+    be restored together from the same point in time:
+        1. LanceDB table TECHSUPPORT_QA_PAIRS (this script)
+        2. techsupport_qa_pairs.md under VERIFIED_TECHSUPPORT_QA_FOLDERPATH
+           (typically LilLisa_Server/data/verified_techsupport/)
+        3. lil-lisa-cron-scripts/techsupport_review_state.json
+    This script does NOT auto-restore markdown or review_state from Lance
+    versions. After rollback_to_version(), it prints a reminder listing
+    the files you must restore yourself (git history for the markdown;
+    backup/copy for review_state).
+
 No index management is performed here: TECHSUPPORT_QA_PAIRS has no persistent
 vector or scalar index today (confirmed via list_indices() -- the only index
 in play is a full-text index LanceDBVectorStore.query() builds lazily, in the
@@ -64,6 +78,24 @@ def _open_table():
     return db.open_table(TECHSUPPORT_QA_TABLE_NAME)
 
 
+def _print_coordinated_restore_reminder(restored_from_version: int) -> None:
+    """Warn that markdown + review_state are not restored by this script."""
+    print()
+    print("=" * 72)
+    print("IMPORTANT: LanceDB rollback is incomplete until you also restore")
+    print("markdown + review_state from the SAME point in time as LanceDB")
+    print(f"version {restored_from_version}. This script does NOT auto-restore them.")
+    print()
+    print("Restore together:")
+    print(f"  1. LanceDB table {TECHSUPPORT_QA_TABLE_NAME}  (just done)")
+    print("  2. techsupport_qa_pairs.md")
+    print("     (VERIFIED_TECHSUPPORT_QA_FOLDERPATH, typically")
+    print("      LilLisa_Server/data/verified_techsupport/techsupport_qa_pairs.md;")
+    print("      GitHub history in Section 7 of the deploy notes)")
+    print("  3. lil-lisa-cron-scripts/techsupport_review_state.json")
+    print("=" * 72)
+
+
 def list_available_versions() -> List[Dict[str, Any]]:
     """Print every version of TECHSUPPORT_QA_PAIRS currently on disk, newest
     last, so someone deciding whether/what to roll back to can see what's
@@ -92,6 +124,10 @@ def rollback_to_version(version_number: int) -> Dict[str, Any]:
     reversible: list_available_versions() will show the pre-rollback state as
     a still-checkoutable earlier version, and rolling back again (to a
     version before *this* rollback) undoes it.
+
+    After restore, prints a reminder that techsupport_qa_pairs.md and
+    techsupport_review_state.json must be restored together with this table.
+    This function does not auto-restore those files.
     """
     table = _open_table()
     available = {v["version"] for v in table.list_versions()}
@@ -113,6 +149,7 @@ def rollback_to_version(version_number: int) -> Dict[str, Any]:
     print(f"  was version {before_version} ({before_rows} rows)")
     print(f"  restored data from version {version_number}")
     print(f"  now version {after_version} ({after_rows} rows) <- new HEAD")
+    _print_coordinated_restore_reminder(version_number)
 
     return {
         "table_name": TECHSUPPORT_QA_TABLE_NAME,

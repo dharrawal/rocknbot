@@ -16,6 +16,7 @@ from utils import (  # noqa: E402
     SLACK_ACTION_VALUE_MAX,
     assert_shared_techsupport_channel_ids,
     build_escalation_button_value,
+    warn_if_escalate_body_channel_mismatch,
 )
 
 
@@ -66,6 +67,28 @@ class SharedTechsupportChannelTests(unittest.TestCase):
             assert_shared_techsupport_channel_ids(
                 {"IDA": "C1", "IDDM": "C2", "IDO": None}
             )
+
+
+class BodyChannelMismatchTests(unittest.TestCase):
+    def test_warns_when_body_channel_differs(self):
+        with self.assertLogs("RL_Logger", level="WARNING") as captured:
+            warned = warn_if_escalate_body_channel_mismatch(
+                {"channel": {"id": "Cforwarded"}},
+                "Cpayload",
+            )
+        self.assertTrue(warned)
+        self.assertTrue(any("Cforwarded" in line and "Cpayload" in line for line in captured.output))
+
+    def test_no_warn_when_channels_match(self):
+        with self.assertNoLogs("RL_Logger", level="WARNING"):
+            self.assertFalse(
+                warn_if_escalate_body_channel_mismatch({"channel": {"id": "Csame"}}, "Csame")
+            )
+
+    def test_no_warn_when_body_channel_missing(self):
+        with self.assertNoLogs("RL_Logger", level="WARNING"):
+            self.assertFalse(warn_if_escalate_body_channel_mismatch({}, "Cpayload"))
+            self.assertFalse(warn_if_escalate_body_channel_mismatch({"channel": {}}, "Cpayload"))
 
 
 if __name__ == "__main__":

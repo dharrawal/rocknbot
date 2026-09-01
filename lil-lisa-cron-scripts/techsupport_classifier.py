@@ -191,6 +191,20 @@ def format_thread_messages(messages: List[Dict[str, Any]], slack_token: Optional
 # --- Classification ---
 
 
+def is_yes_answer(value: Any) -> bool:
+    """Return True iff a classifier yes/no field is yes after light normalization.
+
+    Strip surrounding whitespace, casefold, then strip trailing '.' / '!' so
+    values like "Yes", "YES", and "yes." count as yes. Anything else
+    (including "no", "unknown", empty, or unexpected punctuation) is False
+    so the thread is not ingested.
+    """
+    if value is None:
+        return False
+    text = str(value).strip().casefold().rstrip(".!")
+    return text == "yes"
+
+
 def classify_thread(
     messages: List[Dict[str, Any]],
     slack_token: Optional[str] = None,
@@ -216,12 +230,12 @@ def classify_thread(
     conversation_thread = format_thread_messages(messages, slack_token=slack_token)
 
     useful_result = check_useful(conversation_thread=conversation_thread)
-    is_useful = useful_result.is_useful == "yes"
+    is_useful = is_yes_answer(useful_result.is_useful)
 
     is_conclusive: Optional[bool] = None
     if is_useful and not skip_conclusive:
         conclusive_result = check_conclusive(conversation_thread=conversation_thread)
-        is_conclusive = conclusive_result.is_conclusive == "yes"
+        is_conclusive = is_yes_answer(conclusive_result.is_conclusive)
 
     return {
         "is_useful": is_useful,

@@ -60,17 +60,21 @@ In production these must all point to the **same** real channel (one shared tech
 
 ## 4\. Scripts
 
-| Script | Purpose |
-| :---- | :---- |
-| `nightly_pipeline.py` | The main entry point. Orchestrates everything below, including the GitHub push and the live server's index reload. This is what cron should call. |
-| `nightly_techsupport_sync.py` | Detects new or updated threads in the tech support channel. New parents come from `conversations.history` since last run. Known threads are not all polled: nightly hot window + periodic 90-day catch-up, both capped (see the `TECHSUPPORT_SYNC_*` knobs in Section 2). |
-| `techsupport_classifier.py` | Classifies whether a thread is useful and conclusive (DSPy-based |
-| `techsupport_qa_ingest.py` | Extracts a summary from a resolved thread and adds it to the markdown file plus LanceDB, or merges it into an existing entry (see Section 4a). |
-| `techsupport_contextual_reembed.py` | Periodically re-embeds the whole verified table together (late-chunking), on the interval from Section 2\. |
-| `techsupport_review_sync.py` | Picks up manual edits an expert might make directly to the markdown file and syncs them into LanceDB. Fully optional, not a gate. |
-| `techsupport_rollback.py` | `list_available_versions()` and `rollback_to_version(n)`, see Section 8\. |
-| `github_sync.py` | Pushes the current markdown file to the dedicated GitHub repo. Skips the push if the file hasn't actually changed. Called automatically by `nightly_pipeline.py`, but can also be run standalone if a push needs to be retried manually. |
-| `github_anchor.py` | Generates GitHub-accurate anchor slugs from entry titles, so answers can link directly to the right section of the file on GitHub. |
+| Script | When to run | Purpose |
+| :---- | :---- | :---- |
+| `nightly_pipeline.py` | **Nightly / cron only.** This is the **only** script cron should call (`make run-nightly` in `lil-lisa-cron-scripts`). | The main entry point. Orchestrates everything below, including the GitHub push and the live server's index reload. |
+| `nightly_techsupport_sync.py` | Nightly, via `nightly_pipeline.py` | Detects new or updated threads in the tech support channel. New parents come from `conversations.history` since last run. Known threads are not all polled: nightly hot window + periodic 90-day catch-up, both capped (see the `TECHSUPPORT_SYNC_*` knobs in Section 2). |
+| `techsupport_classifier.py` | Nightly, via `nightly_pipeline.py` | Classifies whether a thread is useful and conclusive (DSPy-based |
+| `techsupport_qa_ingest.py` | Nightly, via `nightly_pipeline.py` | Extracts a summary from a resolved thread and adds it to the markdown file plus LanceDB, or merges it into an existing entry (see Section 4a). |
+| `techsupport_contextual_reembed.py` | Nightly, via `nightly_pipeline.py` (on its own interval) | Periodically re-embeds the whole verified table together (late-chunking), on the interval from Section 2\. |
+| `techsupport_review_sync.py` | Nightly, via `nightly_pipeline.py` | Picks up manual edits an expert might make directly to the markdown file and syncs them into LanceDB. Fully optional, not a gate. |
+| `techsupport_rollback.py` | Manual (ops) | `list_available_versions()` and `rollback_to_version(n)`, see Section 8\. |
+| `github_sync.py` | Nightly, via `nightly_pipeline.py` (or standalone retry) | Pushes the current markdown file to the dedicated GitHub repo. Skips the push if the file hasn't actually changed. Called automatically by `nightly_pipeline.py`, but can also be run standalone if a push needs to be retried manually. |
+| `github_anchor.py` | Library / helper | Generates GitHub-accurate anchor slugs from entry titles, so answers can link directly to the right section of the file on GitHub. |
+| `historical_import_production.py` | **One-shot.** Never cron. Optional: `make run-historical-import`. | One-time bulk import of `data/historical_import/production_1year.txt` into the same verified-techsupport store the nightly pipeline maintains. Resumable; not part of the default schedule. |
+| `backfill_github_urls.py` | **One-shot.** Never cron. Optional: `make run-backfill-github-urls`. | One-time metadata patch: adds `github_url` on existing LanceDB rows that predate the GitHub-anchor feature. New nightly inserts already get this; do not schedule this script. |
+
+Cron must only invoke `nightly_pipeline.py`. Leave `historical_import_production.py` and `backfill_github_urls.py` in `lil-lisa-cron-scripts/` (do not move them into a one-shot folder); they stay off the crontab.
 
 ### 4a. Merge/Enrich: avoiding duplicate entries
 
@@ -172,4 +176,16 @@ Then roll back to a specific version:
 
 This is non-destructive. Rolling back creates a new version rather than deleting anything, so you can always move forward or backward again afterward.
 
-Now that the GitHub repo in Section 7 is live, the markdown file itself also has real version history through normal git commits, so both the database content and the source file can be inspected or reverted independently if needed.  
+Now that the GitHub repo in Section 7 is live, the markdown file itself also has real version history through normal git commits, so both the database content and the source file can be inspected or reverted independently if needed.
+
+### 8a. Restore markdown + review_state with LanceDB
+
+`techsupport_rollback.py` only restores the LanceDB table (`TECHSUPPORT_QA_PAIRS`). It does **not** auto-restore files from Lance versions.
+
+The verified techsupport markdown, `techsupport_review_state.json`, and LanceDB must be restored **together** from the same point in time. Rolling the table back without the matching files will drift: review_state `node_ids` will not match table rows, and the markdown source will not match what retrieval serves.
+
+After `rollback_to_version(N)`, the script prints a loud reminder listing the other files. Restore them yourself:
+
+1. LanceDB `TECHSUPPORT_QA_PAIRS` — this script (`rollback_to_version(N)`).
+2. `techsupport_qa_pairs.md` — under `VERIFIED_TECHSUPPORT_QA_FOLDERPATH` (typically `LilLisa_Server/data/verified_techsupport/techsupport_qa_pairs.md`). Use git history in the Section 7 repo (or a backup) from the same moment as LanceDB version N.
+3. `lil-lisa-cron-scripts/techsupport_review_state.json` — gitignored; restore from a backup/copy taken at that same moment. There is no Lance version of this file.

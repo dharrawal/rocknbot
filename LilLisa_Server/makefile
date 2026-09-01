@@ -13,6 +13,8 @@ LDB_TAG=2.6.0
 
 .EXPORT_ALL_VARIABLES:
 
+# Optional so make works without env; copy from *.example before deploy/run.
+# Keep examples as unquoted KEY=value, no export, no inline comments (Make include ≠ python-dotenv).
 -include ./env/lillisa_server.env
 
 _wait30s:

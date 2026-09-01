@@ -88,6 +88,25 @@ def build_escalation_button_value(
         title = title[: max(0, len(title) - 32)]
 
 
+def warn_if_escalate_body_channel_mismatch(body: Optional[Dict[str, Any]], orig_channel_id: Optional[str]) -> bool:
+    """Warn when Slack interaction body.channel.id differs from button payload channel_id.
+
+    Escalation chat_update/posts use orig_channel_id from the button payload only.
+    body.channel can differ (e.g. forwarded messages) and must not be used for those calls.
+    Returns True when a warning was logged.
+    """
+    if not body or not orig_channel_id:
+        return False
+    body_channel_id = (body.get("channel") or {}).get("id")
+    if body_channel_id and body_channel_id != orig_channel_id:
+        logger.warning(
+            f"[ESCALATE] Slack body channel id {body_channel_id!r} differs from "
+            f"button payload channel_id {orig_channel_id!r}; using payload channel_id"
+        )
+        return True
+    return False
+
+
 def assert_shared_techsupport_channel_ids(product_channels: Dict[str, Optional[str]]) -> None:
     """Production uses one shared tech-support channel for IDA/IDDM/IDO.
 
