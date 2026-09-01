@@ -3,6 +3,7 @@
 import logging
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from time import time_ns
 from typing import Optional
 
@@ -10,7 +11,11 @@ from dotenv import dotenv_values
 
 logger = logging.getLogger("RL_Logger")
 
-LILLISA_SERVER_ENV_DICT = {**dotenv_values("./env/lillisa_server.env")}
+# Anchored to this file, not the cwd: sibling packages (lil-lisa-cron-scripts)
+# import src.utils from their own working directory.
+LILLISA_SERVER_ENV_PATH = Path(__file__).resolve().parent.parent / "env" / "lillisa_server.env"
+
+LILLISA_SERVER_ENV_DICT = {**dotenv_values(str(LILLISA_SERVER_ENV_PATH))}
 # load config params from override folder
 if areofp := LILLISA_SERVER_ENV_DICT.get("LILLISA_SERVER_ENV_OVERRIDE_FILEPATH", None):
     # if the folder exists and contains a file called lillisa_server.env, load it using dotenv
