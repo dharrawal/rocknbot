@@ -33,6 +33,7 @@ from utils import (
     build_escalation_button_value,
     logger,
     parse_get_ans_result,
+    truncate_preserving_code_fences,
 )
 
 lil_lisa_env = dotenv_values("./app_envfiles/lil-lisa.env")
@@ -369,7 +370,7 @@ def clamp_to_slack_block_limit(text: str) -> str:
     """
     if len(text) <= SLACK_BLOCK_TEXT_LIMIT:
         return text
-    return text[:SLACK_BLOCK_TEXT_LIMIT - 3] + "..."
+    return truncate_preserving_code_fences(text, SLACK_BLOCK_TEXT_LIMIT)
 
 
 CONVERSATIONS_REPLIES_RETRY_DELAY_SECONDS = 5.0
@@ -688,7 +689,7 @@ async def tag_techsupport_thread(thread_ts: str, related_entry_title: str) -> No
     a duplicate. Best-effort: failures are logged and swallowed, never block escalation."""
     try:
         full_url = f"{BASE_URL}/tag_techsupport_thread/"
-        await _requests_call(requests.post, 
+        response = await _requests_call(requests.post, 
             full_url,
             params={
                 "thread_ts": thread_ts,
@@ -696,6 +697,15 @@ async def tag_techsupport_thread(thread_ts: str, related_entry_title: str) -> No
                 "encrypted_key": ENCRYPTED_AUTHENTICATION_KEY,
             },
             timeout=60,
+        )
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        body = (exc.response.text or "")[:500] if exc.response is not None else ""
+        logger.error(
+            "An error occurred during the asynchronous call tag_techsupport_thread: HTTP %s body=%r",
+            status,
+            body,
         )
     except Exception as exc:  # pylint: disable=broad-except
         logger.error(f"An error occurred during the asynchronous call tag_techsupport_thread: {exc}")

@@ -33,8 +33,8 @@ If the model emits `[[NO_ANSWER]]` and the top rerank score is `> 3.0`, the iden
 `**[[NO_ANSWER]]` detected with `find()`, not “starts the response”** (`pr42-blockers.1.3`)  
 The prompt says the marker must be first. The code treats **any** occurrence as no-answer, then slices from there. A mention in context, a quoted example, or a mid-response “I would use `[[NO_ANSWER]]` if…” would flip `answer_found` and drop everything before the match. Use `llm_response.lstrip().startswith(marker)` (and ignore the marker inside fenced code).
 
-- **Done:** Implemented. `parse_leading_no_answer_marker` in `LilLisa_Server/src/utils.py` treats no-answer only if the marker starts the response after `lstrip()`. Mid-body / fenced mentions are left in the answer. Used for try-1 and try-2. Unit tests: `LilLisa_Server/tests/test_no_answer_marker.py`. Version-sentence-before-marker remains `pr42-mp.1.2` (not a reason to keep `find()`).
-- **Beads:** `pr42-blockers.1.3` **closed**.
+- **Done:** Implemented. `parse_leading_no_answer_marker` in `LilLisa_Server/src/utils.py` treats no-answer only if the marker starts the response after `lstrip()`. Mid-body / fenced mentions are left in the answer. Used for try-1 and try-2. Unit tests: `LilLisa_Server/tests/test_no_answer_marker.py`. Version-sentence-before-marker is `pr42-mp.1.2` (prompt rule 11 + rule 7 exemption; not a reason to keep `find()`).
+- **Beads:** `pr42-blockers.1.3` **closed**. Version-sentence-before-marker (`pr42-mp.1.2`) is also **closed** (rule 11 + rule 7 exemption).
 
 ### SECURITY (`pr42-blockers.2`) — **open** epic (2/3 children closed)
 
@@ -210,60 +210,105 @@ None identified at high severity beyond the test-script issue (listed under Feat
 
 Fix in this PR if cheap; otherwise track immediately after.
 
-### FEATURE (`pr42-mp.1`)
+### FEATURE (`pr42-mp.1`) — **closed** (11/11 remaining children closed; `pr42-mp.1.1` reparented)
 
 **Fragile “is this a techsupport node?” test** (`pr42-mp.1.1`)  
 `webportal_url is None and github_url is not None` is used for useful links and for `primary_techsupport_match_title`. A doc node missing `webportal_url` would be treated as techsupport and could enrich into the wrong entry. Prefer an explicit metadata flag (`source: techsupport`) set at ingest.
 
+- **Done:** Not treated as a this-PR code change. Heuristic kept for v1. Ingest already stamps `source: techsupport` on new LanceDB rows; retrieval still uses the URL heuristic. Long-term fix is an explicit flag at retrieve time.
+- **Beads:** `pr42-mp.1.1` **open**, P3. Reparented to `pr42-enhancements` (not closed). ID stays `pr42-mp.1.1`.
+
 **Prompt rule clash (`[[NO_ANSWER]]` vs “no tags”)** (`pr42-mp.1.2`)  
 Rule 7: no extraneous symbols/tags/prefixes. Rule 9: start with `[[NO_ANSWER]]`. The version branch then appends another **“10.”** while tables are already rule 10, and tells the model to mention versions even on no-answer (with a carve-out that the marker must stay first). Easy for the model to put the version sentence before the marker. Number the injected rule 11, and exempt the marker from rule 7.
+
+- **Done:** `qa_system_prompt.txt` rule 7 exempts the leading `[[NO_ANSWER]]` marker; rule 9 names that exemption. Injected version text is rule 11 via `append_product_version_rule` in `LilLisa_Server/src/utils.py`. Tests: `LilLisa_Server/tests/test_qa_version_rule.py`.
+- **Beads:** `pr42-mp.1.2` **closed**.
 
 **Init-error paths set `answer_found: True`** (`pr42-mp.1.3`)  
 If IDA/IDDM/IDO indices are missing, the user sees “contact an administrator” **without** escalation. If that is intentional (don’t page tech support for a down bot), comment it. Otherwise `False` is more consistent.
 
+- **Done:** Behavior kept (`answer_found: True`). Comments on the IDA/IDDM/IDO init-error returns in `answer_from_document_retrieval` state that hiding escalate is intentional so we do not page tech support for a down bot.
+- **Beads:** `pr42-mp.1.3` **closed**.
+
 `**match_context_text` is always `""**` (`pr42-mp.1.4`)  
 `invoke()` reads it from the retrieval JSON; `answer_from_document_retrieval` never sets it. Dead field unless the Slack client fills it.
+
+- **Done:** Field removed from `/invoke/` JSON (`LilLisa_Server/src/main.py`). Nothing read it.
+- **Beads:** `pr42-mp.1.4` **closed**.
 
 **Anyone in the channel can escalate anyone else’s thread** (`pr42-mp.1.5`)  
 Payload `user_id` is the original asker, not the clicker. A troll can page tech support and `@` the asker. Restrict to the asker (and maybe the product expert), or include the clicker in the TS note (`clicked by <@U…>`). This is also an abuse/security concern.
 
+- **Done:** Escalate remains open to anyone in the channel. Tech-support context note now includes `Clicked by <@U…>` from Slack `body["user"]["id"]`. Asker-only restriction not in this PR.
+- **Beads:** `pr42-mp.1.5` **closed**.
+
 `**@` mention in a tech-support channel still runs `process_msg**` (`pr42-mp.1.6`)  
 Techsupport channels special-case mentions into `process_msg`, but `determine_product_and_expert` does not map TS channel IDs, so the user gets “I am unable to provide answers in this channel.” Either map TS channels to the product (no escalate button there) or don’t call `process_msg` for mentions in TS.
+
+- **Done:** Mentions in TS no longer call `process_msg`. Bot replies in-thread: “Ask in the relevant product channel, not here.”
+- **Beads:** `pr42-mp.1.6` **closed**.
 
 **Slack `value` 2000-char cap can still overrun** (`pr42-mp.1.7`)  
 Query is capped at 1500; `primary_techsupport_match_title` is not. Long titles + JSON envelope can make Slack drop the action. Cap or hash the title.
 
+- **Done:** `build_escalation_button_value` in `lil-lisa/src/utils.py` shrinks the title until the JSON is ≤ 2000 (drops the title field if it still cannot fit). Tests: `lil-lisa/tests/test_escalation_button_value.py`.
+- **Beads:** `pr42-mp.1.7` **closed**.
+
 **Mixed embedding spaces** (`pr42-mp.1.8`)  
 Nightly insert uses Voyage `input_type="query"` (same as `VoyageEmbedding._get_text_embedding`). Weekly reembed uses contextual `input_type="document"` over the whole file. New rows live in a different space until the next reembed. Document that in ops, or embed new rows with a single-chunk contextual call so the space matches. (`_get_text_embedding` using `"query"` for document-shaped calls is the same helper, moved into `embedding_config.py`.)
+
+- **Done (docs only):** Ops note in `PR42 Release and Deployment Notes.md` §4b and ingest module comments. Nightly insert still uses query-space until weekly reembed.
+- **Beads:** `pr42-mp.1.8` **closed**. Follow-on task `pr42-enhancements.3` (**open**, P3, `discovered-from` this task): embed new rows with a single-chunk contextual / `document` call so they match `techsupport_contextual_reembed.py`.
 
 `**##` in generated titles/summaries breaks the parser** (`pr42-mp.1.9`)  
 `parse_summary_markdown` splits on `^##`. Prompt says not to use `#` in titles; models still do. Sanitize (strip heading markers; indent `##` in body).
 
+- **Done:** `techsupport_markdown.py` strips `#` from titles and indents body lines that start with `##`. Called on generate / add / replace / enrich. Tests: `lil-lisa-cron-scripts/tests/test_techsupport_markdown.py`.
+- **Beads:** `pr42-mp.1.9` **closed**.
+
 **Enrich matches title exactly; first hit wins** (`pr42-mp.1.10`)  
 Duplicate auto-titles merge into the wrong entry. Prefer node id / markdown index from the tag payload, not title string.
+
+- **Done (uniqueness at ingest):** New titles that collide get ` - 2`, ` - 3`, … (`uniquify_techsupport_title`). Enrich still looks up by exact title; uniqueness makes first-hit safer on new data.
+- **Beads:** `pr42-mp.1.10` **closed**. Follow-on task `pr42-enhancements.4` (**open**, P3, `discovered-from` this task): store a stable id in the tag payload and enrich by id (title fallback for old tags).
 
 `**historical_import.py` is retired but runnable** (`pr42-mp.1.11`)  
 It still extracts Q&A and passes `(question, answer)` into `append_summary_to_markdown`. A future “1-year production import” would corrupt the prose file. Guard `main()` with a hard error (“retired; use …”) or delete/move it.
 
+- **Done:** `main()` prints a retired message and `sys.exit(2)` before DSPy/LanceDB import when run as a script. File kept for reference. Use `historical_import_production.py` or `nightly_pipeline.py` instead.
+- **Beads:** `pr42-mp.1.11` **closed**.
+
 **Single `TECHSUPPORT_CHANNEL_ID` vs three Slack env vars** (`pr42-mp.1.12`)  
 Comments say IDA/IDDM/IDO channels are the same. If they ever differ, the pipeline only watches one. Assert they match at bot+pipeline startup, or sync all three.
+
+- **Done:** Bot `assert_shared_techsupport_channel_ids` raises if configured IDA/IDDM/IDO IDs disagree (unset products ignored). Also warns when IDO’s channel is unset. Pipeline `assert_pipeline_matches_product_channel_ids` raises if optional product-specific IDs in `techsupport_sync.env` differ from `TECHSUPPORT_CHANNEL_ID`. Documented in env example and Release/Deployment Notes.
+- **Beads:** `pr42-mp.1.12` **closed**. Parent FEATURE epic `pr42-mp.1` **closed**.
 
 ### SECURITY (`pr42-mp.2`)
 
 None beyond the escalate-anyone-else’s-thread item under Feature.
 
-### PERFORMANCE (`pr42-mp.3`)
+### PERFORMANCE (`pr42-mp.3`) — **closed** (1/1 children closed)
 
 `**_no_answer_streak` never expires** (`pr42-mp.3.1`)  
 In-process `dict` keyed by `session_id`. Comment says “flag after one rephrase,” but `needs_escalation = not answer_found` (streak unused). Unbounded growth on a long-lived server. Drop the dict or bound/TTL it. Comment and code disagree.
 
-### RELIABILITY (`pr42-mp.4`)
+- **Done:** Removed `_no_answer_streak` and the unused increment/reset. `needs_escalation` is still `not answer_found`. Debug log no longer includes the streak.
+- **Beads:** `pr42-mp.3.1` **closed**. Parent PERFORMANCE epic `pr42-mp.3` **closed**.
+
+### RELIABILITY (`pr42-mp.4`) — **closed** (2/2 children closed)
 
 `**clamp_to_slack_block_limit` is a hard slice** (`pr42-mp.4.1`)  
 Unlike server `_truncate_match_answer`, this can cut inside fenced code and produce `invalid_blocks` anyway (fallback then strips formatting). Prefer the fence-aware truncate.
 
+- **Done:** `truncate_preserving_code_fences` in `lil-lisa/src/utils.py` (copy of server fence logic; no shared package). `clamp_to_slack_block_limit` uses it. Tests: `lil-lisa/tests/test_truncate_preserving_code_fences.py`.
+- **Beads:** `pr42-mp.4.1` **closed**.
+
 `**tag_techsupport_thread` ignores HTTP status** (`pr42-mp.4.2`)  
 No `raise_for_status()`. Failed tags look successful; nightly ingest will create a duplicate instead of merging.
+
+- **Done:** Slack `tag_techsupport_thread` calls `raise_for_status()`. HTTP failures log status and a truncated body and are still swallowed so escalate UX is unchanged.
+- **Beads:** `pr42-mp.4.2` **closed**. Parent RELIABILITY epic `pr42-mp.4` **closed**.
 
 ### INSTRUMENTATION (`pr42-mp.5`)
 
@@ -376,13 +421,19 @@ Stores `result` with count `0` then increments `base`. Worth a unit test against
 
 ---
 
-## Follow-on enhancements (`pr42-enhancements`) — **open** epic (0/2 children complete)
+## Follow-on enhancements (`pr42-enhancements`) — **open** epic (0/5 children complete)
 
-Created this session for work demoted from blockers. Not required before merge.
+Created for work demoted from blockers (and later from hp/mp). Not required before merge.
 
 **Validate techsupport classifier (labeled dataset + F1)** (`pr42-enhancements.1`) — **open** epic, P3, `discovered-from` `pr42-blockers.1.1`. Collect labeled useful/conclusive threads, switch to a stronger model, report F1. Cheaper first step on the epic: Slack resolution reaction or don’t treat auto-ingest as expert-verified until human sign-off.
 
 **Eval same-prompt NO_ANSWER retry relevance from logs** (`pr42-enhancements.2`) — **open** task, P3, `discovered-from` `pr42-blockers.1.2`. Extract `NO_ANSWER_RETRY |` INFO JSON (retry is **served**, so `changed_outcome=true` is live user impact), judge whether try-2 is grounded in the top chunk, report flip rate and grounded-among-flips, then decide keep / drop / change the retry.
+
+**Explicit `source: techsupport` metadata at retrieve** (`pr42-mp.1.1`) — **open** task, P3, reparented from `pr42-mp.1`. Heuristic (`webportal_url is None and github_url is not None`) kept for this PR. Ingest already sets `source: techsupport` on new rows; retrieval should use that flag (backfill or treat missing as not-techsupport) so a doc chunk missing `webportal_url` cannot become `primary_techsupport_match_title` / enrich the wrong entry.
+
+**Embed nightly techsupport inserts in the same space as weekly contextual reembed** (`pr42-enhancements.3`) — **open** task, P3, `discovered-from` `pr42-mp.1.8`. In-PR work was ops docs only. This is the real fix: embed new verified Q&A rows with a single-chunk contextual / `input_type="document"` call matching `techsupport_contextual_reembed.py`, not `VoyageEmbedding._get_text_embedding` query-space. Acceptance: nightly add/replace/enrich vectors are comparable to post-reembed vectors; document extra Voyage cost.
+
+**Enrich techsupport by stable id, not title string** (`pr42-enhancements.4`) — **open** task, P3, `discovered-from` `pr42-mp.1.10`. In-PR work uniquifies auto-titles at ingest (` - 2`). This enhancement puts a stable id in the tag payload (LanceDB node id and/or markdown index). Nightly enrich looks up by id; title is fallback for old tags. Duplicate titles must not merge into the wrong entry if uniqueness-at-ingest is bypassed.
 
 ---
 
@@ -407,3 +458,5 @@ Checked each original finding against `git diff 17de46f 66733fe` and the `66733f
 5. Finish the log downgrade (retry + escalate + `conv_dict`). Note: retry now logs a structured INFO `NO_ANSWER_RETRY | <json>` payload on purpose for `pr42-enhancements.2`; that line is not a leftover dump.
 
 **Worked this session (beads):** Closed `pr42-blockers.4` and children `.4.1`–`.4.5` (escalate lock+rollback, omit button when TS env unset, parse timeout strings, atomic state/markdown + insert-then-delete). Parent `pr42-blockers` remains **open** while `pr42-blockers.2.3` is open. `pr42-blockers.1` and `pr42-blockers.3` were already closed.
+
+**Also this session (`pr42-mp.1`):** Closed FEATURE epic `pr42-mp.1` and children `.1.2`–`.1.12` (prompt rule 11, init-error comments, drop `match_context_text`, clicker in TS note, TS mention one-liner, Slack value cap, embedding-space ops docs, `##` sanitize, unique titles, retired `historical_import.py`, shared-channel asserts). `pr42-mp.1.1` left **open** and reparented to `pr42-enhancements`. New follow-ons: `pr42-enhancements.3` (insert embeddings = weekly reembed), `pr42-enhancements.4` (enrich by stable id).

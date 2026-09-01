@@ -596,10 +596,6 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-# Tracks, per session_id, how many consecutive "answer_found: false" responses
-# have occurred in a row. Used to flag escalation after one rephrase attempt.
-_no_answer_streak: dict[str, int] = {}
-
 @app.middleware("http")
 async def custom_metrics(request: Request, call_next):
     if request.url.path =="/docs":
@@ -965,16 +961,11 @@ def invoke(
             answer_found = True
             primary_techsupport_match_title = None
 
-        # Track consecutive "answer not found" responses per session (kept for logging/analytics).
-        if answer_found:
-            _no_answer_streak[session_id] = 0
-        else:
-            _no_answer_streak[session_id] = _no_answer_streak.get(session_id, 0) + 1
         needs_escalation = not answer_found
 
         utils.logger.debug(
-            "DEBUG_NO_ANSWER | session_id=%s answer_found=%s no_answer_streak=%s needs_escalation=%s response_text=%r",
-            session_id, answer_found, _no_answer_streak.get(session_id, 0), needs_escalation, response_text,
+            "DEBUG_NO_ANSWER | session_id=%s answer_found=%s needs_escalation=%s response_text=%r",
+            session_id, answer_found, needs_escalation, response_text,
         )
 
         # Add assistant and user response to conversation history

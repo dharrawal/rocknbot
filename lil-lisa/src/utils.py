@@ -34,6 +34,25 @@ def parse_get_ans_result(raw_result: str) -> Dict[str, Any]:
     return parsed
 
 
+def truncate_preserving_code_fences(text: str, max_length: int) -> str:
+    """Truncate text without leaving an unclosed ``` fence (Slack mrkdwn).
+
+    Same approach as LilLisa_Server `_truncate_match_answer`: if a hard slice
+    would land inside a fence, cut before that fence; if the window is only the
+    first fence, close it instead of dropping all text.
+    """
+    if len(text) <= max_length:
+        return text
+    truncated = text[:max_length]
+    if truncated.count("```") % 2 != 0:
+        fence_index = truncated.rfind("```")
+        before_fence = truncated[:fence_index].rstrip()
+        if before_fence:
+            return before_fence + "..."
+        return truncated + "\n```..."
+    return truncated + "..."
+
+
 SLACK_ACTION_VALUE_MAX = 2000
 ESCALATE_VALUE_QUERY_MAX_LENGTH = 1500
 
