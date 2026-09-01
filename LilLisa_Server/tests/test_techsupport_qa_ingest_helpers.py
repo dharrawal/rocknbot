@@ -3,7 +3,7 @@ Unit tests for defensive techsupport review-state lookup, and a source-level
 check that historical_import_production dry-run uses the public ingest API.
 
 Run from LilLisa_Server:
-    PYTHONPATH=. python3 scripts/test_techsupport_qa_ingest_helpers.py
+    PYTHONPATH=. python3 tests/test_techsupport_qa_ingest_helpers.py
 """
 
 import ast
@@ -11,8 +11,8 @@ import sys
 import unittest
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
 
 from techsupport_review_state import node_ids_from_review_entry, review_entry_state  # noqa: E402
 
@@ -43,7 +43,7 @@ class ReviewEntryStateTests(unittest.TestCase):
 
 class HistoricalImportUsesPublicIngestApiTests(unittest.TestCase):
     def test_dry_run_imports_generate_verified_title_and_summary_not_predicts(self):
-        source = (SCRIPT_DIR / "historical_import_production.py").read_text(encoding="utf-8")
+        source = (SCRIPTS_DIR / "historical_import_production.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
         imported_from_ingest: set[str] = set()
         for node in ast.walk(tree):

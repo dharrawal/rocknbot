@@ -2,15 +2,15 @@
 Unit tests for obvious-PII redaction on generated techsupport title/summary text.
 
 Run from LilLisa_Server:
-    PYTHONPATH=. python3 scripts/test_techsupport_pii_redact.py
+    PYTHONPATH=. python3 tests/test_techsupport_pii_redact.py
 """
 
 import sys
 import unittest
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
 
 from techsupport_pii import PII_REDACTED_PLACEHOLDER, redact_obvious_pii  # noqa: E402
 

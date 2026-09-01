@@ -2,7 +2,7 @@
 Unit tests for leading [[NO_ANSWER]] detection.
 
 Run from LilLisa_Server:
-    PYTHONPATH=. python3 scripts/test_no_answer_marker.py
+    PYTHONPATH=. python3 tests/test_no_answer_marker.py
 """
 
 import sys

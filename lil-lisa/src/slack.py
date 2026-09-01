@@ -85,6 +85,8 @@ ESCALATE_NOTE_TEXT = (
     "If you are not satisfied with the answer and confident that your question is clear "
     "and complete, press the button below to post your question in the tech support channel."
 )
+ESCALATE_ALREADY_POSTED_TEXT = "Already posted to tech support."
+ESCALATION_BLOCK_IDS = frozenset({"escalation_note", "escalation_actions"})
 
 
 def build_escalation_button_value(
@@ -140,6 +142,62 @@ def build_escalation_blocks(button_value: str, prominent: bool) -> List[Dict[str
         note_block,
         {"type": "actions", "block_id": "escalation_actions", "elements": [button]},
     ]
+
+
+def _message_has_escalation_blocks(blocks: List[Dict[str, Any]]) -> bool:
+    return any(block.get("block_id") in ESCALATION_BLOCK_IDS for block in blocks)
+
+
+def _blocks_without_escalation(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop escalate note/actions and append a short already-posted marker."""
+    stripped = [block for block in blocks if block.get("block_id") not in ESCALATION_BLOCK_IDS]
+    stripped.append(
+        {
+            "type": "context",
+            "block_id": "escalation_note",
+            "elements": [{"type": "mrkdwn", "text": ESCALATE_ALREADY_POSTED_TEXT}],
+        }
+    )
+    return stripped
+
+
+async def strip_escalation_blocks_from_thread(client, channel_id: str, thread_ts: str) -> None:
+    """Remove escalate buttons from every bot reply in the thread.
+
+    After a successful escalate (or a duplicate click when the lock already holds),
+    leftover buttons on earlier/later bot messages are confusing: clicks no-op or
+    look broken. Replace them with an "Already posted to tech support." note.
+    """
+    await ensure_bot_id()
+    try:
+        replies = await conversations_replies_with_retry(channel=channel_id, ts=thread_ts)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error(
+            f"[ESCALATE] Failed to fetch thread replies to strip escalate buttons "
+            f"channel={channel_id!r} thread_ts={thread_ts!r}: {exc}"
+        )
+        return
+
+    for msg in replies.get("messages", []):
+        if msg.get("user") != BOT_USER_ID:
+            continue
+        blocks = msg.get("blocks") or []
+        if not _message_has_escalation_blocks(blocks):
+            continue
+        updated_blocks = _blocks_without_escalation(blocks)
+        try:
+            await client.chat_update(
+                channel=channel_id,
+                ts=msg["ts"],
+                text=msg.get("text", "") or ESCALATE_ALREADY_POSTED_TEXT,
+                blocks=updated_blocks,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error(
+                f"[ESCALATE] Failed to strip escalate blocks from message "
+                f"channel={channel_id!r} ts={msg.get('ts')!r}: {exc}"
+            )
+
 
 def get_last_bot_message(messages, current_ts, skip_text="Processing..."):
     """
@@ -878,6 +936,8 @@ async def handle_escalate_to_techsupport(ack, body, client):
     # Claim the lock before slow I/O so two clicks cannot both refine and both post.
     if not check_and_update_endorsement(orig_thread_ts, "escalated"):
         logger.info(f"[ESCALATE DUPLICATE] Thread {orig_thread_ts} already escalated, skipping.")
+        # Still strip leftover buttons on other bot replies so duplicate clicks aren't silent no-ops.
+        await strip_escalation_blocks_from_thread(client, orig_channel_id, orig_thread_ts)
         return
 
     # Refine the query only when there was more than one user message in the thread; a single
@@ -1000,21 +1060,8 @@ async def handle_escalate_to_techsupport(ack, body, client):
     except Exception as exc:  # pylint: disable=broad-except
         logger.error(f"[ESCALATE] Failed to post confirmation reply: {exc}")
 
-    # Strip the button (and its note) so it can't be clicked again.
-    original_blocks = body["message"].get("blocks", [])
-    updated_blocks = [
-        block for block in original_blocks
-        if block.get("block_id") not in {"escalation_note", "escalation_actions"}
-    ]
-    try:
-        await client.chat_update(
-            channel=body["channel"]["id"],
-            ts=body["message"]["ts"],
-            text=body["message"].get("text", ""),
-            blocks=updated_blocks,
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.error(f"[ESCALATE] Failed to update original message with escalation status: {exc}")
+    # Strip escalate buttons from every bot reply in the thread (not just the clicked message).
+    await strip_escalation_blocks_from_thread(client, orig_channel_id, orig_thread_ts)
 
 
 @app.event("reaction_added")

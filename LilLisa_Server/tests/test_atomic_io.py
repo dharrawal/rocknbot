@@ -2,7 +2,7 @@
 Unit tests for atomic JSON/text writes (temp + os.replace).
 
 Run from LilLisa_Server:
-    PYTHONPATH=. python3 scripts/test_atomic_io.py
+    PYTHONPATH=. python3 tests/test_atomic_io.py
 """
 
 import json
@@ -12,8 +12,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
 
 from atomic_io import atomic_write_json, atomic_write_text  # noqa: E402
 import nightly_techsupport_sync as sync_mod  # noqa: E402

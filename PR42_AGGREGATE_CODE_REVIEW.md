@@ -33,7 +33,7 @@ If the model emits `[[NO_ANSWER]]` and the top rerank score is `> 3.0`, the iden
 `**[[NO_ANSWER]]` detected with `find()`, not “starts the response”** (`pr42-blockers.1.3`)  
 The prompt says the marker must be first. The code treats **any** occurrence as no-answer, then slices from there. A mention in context, a quoted example, or a mid-response “I would use `[[NO_ANSWER]]` if…” would flip `answer_found` and drop everything before the match. Use `llm_response.lstrip().startswith(marker)` (and ignore the marker inside fenced code).
 
-- **Done:** Implemented. `parse_leading_no_answer_marker` in `LilLisa_Server/src/utils.py` treats no-answer only if the marker starts the response after `lstrip()`. Mid-body / fenced mentions are left in the answer. Used for try-1 and try-2. Unit tests: `LilLisa_Server/scripts/test_no_answer_marker.py`. Version-sentence-before-marker remains `pr42-mp.1.2` (not a reason to keep `find()`).
+- **Done:** Implemented. `parse_leading_no_answer_marker` in `LilLisa_Server/src/utils.py` treats no-answer only if the marker starts the response after `lstrip()`. Mid-body / fenced mentions are left in the answer. Used for try-1 and try-2. Unit tests: `LilLisa_Server/tests/test_no_answer_marker.py`. Version-sentence-before-marker remains `pr42-mp.1.2` (not a reason to keep `find()`).
 - **Beads:** `pr42-blockers.1.3` **closed**.
 
 ### SECURITY (`pr42-blockers.2`) — **open** epic (2/3 children closed)
@@ -53,7 +53,7 @@ Full User/Assistant transcript by `session_id` (Slack uses `conv_id` as `session
 **PII / customer data in the bot and in GitHub** (`pr42-blockers.2.3`)  
 Ingest comments claim no PII stripping and that content “stays Slack-only.” Summaries are embedded for product Slack Q&A **and** pushed to a GitHub repo. Threads are formatted with display names. The summarize prompt asks not to mention usernames; it does not strip emails, hostnames, ticket IDs, or customer tenant details. Add a redaction pass (or refuse to ingest messages that look like secrets/PII) before markdown/LanceDB/GitHub.
 
-- **Partial:** Summarize / merge / title prompts now tell the model to omit emails, hostnames, IPs, ticket IDs, tenant/customer names, and secrets. `redact_obvious_pii()` in `LilLisa_Server/scripts/techsupport_pii.py` runs on generated title/summary before markdown/LanceDB/GitHub (add, replace, enrich). Covers emails, Slack mentions, AKIA keys, PEM private keys, `password=`/`secret=`/`token=`/`api_key=` assignments, `INC`/`SR`/`HD`/`TICKET` ids, `*.local`/`*.internal`/`*.lan`/`*.corp`/`*.intranet` FQDNs, and RFC1918/loopback/link-local IPv4. Product versions like `7.3.1.0` are not treated as IPs. Tests: `LilLisa_Server/scripts/test_techsupport_pii_redact.py`.
+- **Partial:** Summarize / merge / title prompts now tell the model to omit emails, hostnames, IPs, ticket IDs, tenant/customer names, and secrets. `redact_obvious_pii()` in `LilLisa_Server/scripts/techsupport_pii.py` runs on generated title/summary before markdown/LanceDB/GitHub (add, replace, enrich). Covers emails, Slack mentions, AKIA keys, PEM private keys, `password=`/`secret=`/`token=`/`api_key=` assignments, `INC`/`SR`/`HD`/`TICKET` ids, `*.local`/`*.internal`/`*.lan`/`*.corp`/`*.intranet` FQDNs, and RFC1918/loopback/link-local IPv4. Product versions like `7.3.1.0` are not treated as IPs. Tests: `LilLisa_Server/tests/test_techsupport_pii_redact.py`.
 - **Still open:** Tune remaining patterns against a real `techsupport_qa_pairs.md` (customer/tenant names, bare hostnames, public IPv4/IPv6, org-specific Jira keys, and anything the current filters miss). No sample doc in this tree.
 - **Beads:** `pr42-blockers.2.3` **open** (P0). Parent epic `pr42-blockers.2` remains **open** until this child closes.
 
@@ -62,7 +62,7 @@ Ingest comments claim no PII stripping and that content “stays Slack-only.” 
 **Nightly sync is O(all known threads)** (`pr42-blockers.3.1`)  
 `sync()` calls `conversations.replies` for **every previously seen thread**, throttled at 0.3s. A multi-year channel is thousands of API calls per run, plus rate limits and `channel_not_found` retries. The ~4-year bootstrap makes this worse. Need a cheaper “updated threads” strategy (e.g. store `latest_reply` from history where possible, or cap/age out dead threads). Do not ship “check every historical thread every night” as the long-term design.
 
-- **Done:** `sync()` no longer calls `conversations.replies`. New threads still take `latest_reply` from `conversations.history`. Known threads get a parent-only `history` lookup (`inclusive`, `limit=1`). Nightly hot window: 30 days (`TECHSUPPORT_SYNC_HOT_DAYS`). Periodic catch-up every `TECHSUPPORT_SYNC_CATCHUP_INTERVAL_DAYS` (default 7) covers threads within 90 days (`TECHSUPPORT_SYNC_CATCHUP_AGE_DAYS`) that were not in the hot set. Each set is capped at `TECHSUPPORT_SYNC_MAX_PARENT_LOOKUPS` (200), hottest first. Threads quieter than 90 days stay in `techsupport_sync_state.json` (including `added_to_verified_db`) but are not polled. Tests: `LilLisa_Server/scripts/test_nightly_techsupport_sync.py`.
+- **Done:** `sync()` no longer calls `conversations.replies`. New threads still take `latest_reply` from `conversations.history`. Known threads get a parent-only `history` lookup (`inclusive`, `limit=1`). Nightly hot window: 30 days (`TECHSUPPORT_SYNC_HOT_DAYS`). Periodic catch-up every `TECHSUPPORT_SYNC_CATCHUP_INTERVAL_DAYS` (default 7) covers threads within 90 days (`TECHSUPPORT_SYNC_CATCHUP_AGE_DAYS`) that were not in the hot set. Each set is capped at `TECHSUPPORT_SYNC_MAX_PARENT_LOOKUPS` (200), hottest first. Threads quieter than 90 days stay in `techsupport_sync_state.json` (including `added_to_verified_db`) but are not polled. Tests: `LilLisa_Server/tests/test_nightly_techsupport_sync.py`.
 - **Beads:** task `pr42-blockers.3.1` **closed**. Sub-epic `pr42-blockers.3` (PERFORMANCE) **closed** (1/1 children). Parent epic `pr42-blockers` remains **open**
 
 ### RELIABILITY (`pr42-blockers.4`) — **closed** (5/5 children closed)
@@ -88,7 +88,7 @@ Comment says the button will be disabled if the channel env is unset. `process_m
 `**json.loads(raw_result)` can leave “Processing…” forever** (`pr42-blockers.4.4`)  
 `get_ans` already returns plain strings on timeout/exception. `process_msg` still does `parsed = json.loads(raw_result)` with no try/except. That exception never hits `_post_message_with_fallback`. Wrap parse failure and post the error text.
 
-- **Done:** `parse_get_ans_result` in `lil-lisa/src/utils.py` treats non-object JSON as the reply `response`. Tests: `lil-lisa/src/test_parse_get_ans_result.py`.
+- **Done:** `parse_get_ans_result` in `lil-lisa/src/utils.py` treats non-object JSON as the reply `response`. Tests: `lil-lisa/tests/test_parse_get_ans_result.py`.
 - **Beads:** `pr42-blockers.4.4` **closed**.
 
 **Crash windows lose or duplicate verified knowledge** (`pr42-blockers.4.5`)  
@@ -98,7 +98,7 @@ Comment says the button will be disabled if the channel env is unset. `process_m
 - `save_state`: truncating write, not temp+`replace` → kill mid-write corrupts `techsupport_sync_state.json`.  
 Write markdown/state atomically; on replace, insert new nodes then delete old; `os.replace` for JSON.
 
-- **Done:** `atomic_io.atomic_write_text` / `atomic_write_json` (temp + `os.replace`) used by ingest markdown/review state, `nightly_techsupport_sync.save_state`, and reembed `save_state`. Replace and enrich insert new LanceDB nodes, save review state, then `delete_nodes`. `add_verified_qa_pair` with a known `thread_ts` delegates to replace. Tests: `LilLisa_Server/scripts/test_atomic_io.py`.
+- **Done:** `atomic_io.atomic_write_text` / `atomic_write_json` (temp + `os.replace`) used by ingest markdown/review state, `nightly_techsupport_sync.save_state`, and reembed `save_state`. Replace and enrich insert new LanceDB nodes, save review state, then `delete_nodes`. `add_verified_qa_pair` with a known `thread_ts` delegates to replace. Tests: `LilLisa_Server/tests/test_atomic_io.py`.
 - **Beads:** `pr42-blockers.4.5` **closed**. Sub-epic `pr42-blockers.4` **closed**. Parent epic `pr42-blockers` remains **open** while `pr42-blockers.2.3` is open.
 
 ### INSTRUMENTATION (`pr42-blockers.5`)
@@ -115,19 +115,32 @@ None identified at blocker severity.
 
 Should fix before merge.
 
-### FEATURE (`pr42-hp.1`)
+### FEATURE (`pr42-hp.1`) — **closed** (4/4 children closed)
 
 **Stream path ignores the new Q&A contract** (`pr42-hp.1.1`)  
 `/invoke/` returns `answer_found`, `needs_escalation`, `links_text`, `primary_techsupport_match_title`. `/invoke_stream_with_nodes/` still only parses `response` + `reranked_nodes`. Fine if Slack only uses `/invoke/`; if the web UI streams, escalation and source links never appear there. State this in the PR, or wire the same fields into the stream.
 
+- **Done (won’t wire stream):** Web UI is intentionally behind; Slack-only for v1. By design: the web app has no auth, and we do not want unauthenticated users escalating to tech support or seeing tech-support answers that may contain PII. `/invoke_stream_with_nodes/` left unchanged. Same note posted as a PR #42 comment (reviewer account cannot edit the fork PR body; submitter should fold it into the description).
+- **Beads:** `pr42-hp.1.1` **closed**.
+
 **Other escalate buttons in the thread stay live** (`pr42-hp.1.2`)  
 `chat_update` only strips `escalation_note` / `escalation_actions` on the **clicked** message. Earlier/later bot replies still show the button. After a successful escalate those clicks no-op (if the tracker held). Strip them, or replace with “already posted to tech support.”
+
+- **Done:** After a successful tech-support post (and on the duplicate-lock path), walk the whole thread via `conversations_replies`, strip escalate blocks from every bot message that still has them, and replace with an “Already posted to tech support.” context block. Helper: `strip_escalation_blocks_from_thread` in `lil-lisa/src/slack.py`.
+- **Beads:** `pr42-hp.1.2` **closed**.
 
 **Enrichment bar is too low** (`pr42-hp.1.3`)  
 Tagged threads only need `is_useful` (conclusiveness skipped). A tagged escalation that is still an open argument can `MergeTechsupportSummaries` into a good verified entry. Require conclusive (or a dedicated “new insight vs noise” classifier) before enrich.
 
+- **Reviewer conclusion:** Enrich is **not** a full regeneration. `enrich_verified_entry` summarizes the new thread, then `MergeTechsupportSummaries` does a merge/append (preserve existing content, add new insight). Title is reused verbatim. LanceDB: insert new nodes, then delete that entry’s old node ids — so duplicate **table rows** for the entry are removed, but duplicate **facts in the prose** are not guaranteed. Unresolved tagged threads can still merge unfinished debate into a good article. Differs from `replace_verified_qa_pair`, which regenerates from the same thread’s full history.
+- **Author decision:** Keep current behavior (`skip_conclusive=True` when tagged). No code change.
+- **Beads:** `pr42-hp.1.3` **closed** (won’t-fix / accepted as designed).
+
 `**test_techsupport_*.py` are not tests** (`pr42-hp.1.4`)  
 Live Slack + live LanceDB eyeball scripts, with a hardcoded production-ish `DEFAULT_THREAD_TS`. They can mutate the verified table. Rename to `tools/` or guard with `--write`, and add pytest for `parse_summary_markdown`, slugger, and state transitions (no network).
+
+- **Done:** Live scripts moved to `LilLisa_Server/smoke/` (dropped `test_` prefix so pytest won’t collect them): `smoke/techsupport_qa_ingest.py`, `smoke/techsupport_classifier.py`. Existing unit tests moved to `LilLisa_Server/tests/` and `lil-lisa/tests/`. No new tests added (no parse_summary_markdown / slugger / state-transition coverage in this pass). No `lil-lisa-web` smoke/tests folders (nothing to move).
+- **Beads:** `pr42-hp.1.4` **closed**. Parent FEATURE epic `pr42-hp.1` **closed**.
 
 ### SECURITY (`pr42-hp.2`)
 

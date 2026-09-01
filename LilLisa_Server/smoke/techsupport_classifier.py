@@ -1,6 +1,8 @@
 """
-test_techsupport_classifier.py
+smoke/techsupport_classifier.py
 ====================================
+LIVE smoke check (not a unit test): hits real Slack. Do not collect with pytest.
+
 Ad-hoc sanity-check script: fetches a handful of real threads from the
 test-techsupport channel (reusing nightly_techsupport_sync.py's Slack
 fetching logic -- same token/channel env, same paginate_messages/load_env
@@ -12,8 +14,8 @@ against what actually happened in each thread.
 are unoptimized zero-shot outputs with no validation data or tuning behind
 them yet. This script is for manual eyeballing, not a benchmark. ***
 
-Usage:
-    python test_techsupport_classifier.py [thread_ts ...]
+Usage (from LilLisa_Server):
+    python3 smoke/techsupport_classifier.py [thread_ts ...]
 
 With no args, picks up to 4 thread_ts already tracked in
 techsupport_sync_state.json, preferring ones that have actual reply activity
@@ -24,8 +26,9 @@ import sys
 from pathlib import Path
 from typing import List
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
+SMOKE_DIR = Path(__file__).resolve().parent
+SCRIPTS_DIR = SMOKE_DIR.parent / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
 
 from nightly_techsupport_sync import load_env, load_state, paginate_messages  # noqa: E402
 from techsupport_classifier import classify_thread  # noqa: E402

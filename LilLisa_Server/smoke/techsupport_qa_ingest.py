@@ -1,6 +1,9 @@
 """
-test_techsupport_qa_ingest.py
+smoke/techsupport_qa_ingest.py
 ====================================
+LIVE smoke check (not a unit test): hits real Slack + live LanceDB and can
+mutate the verified techsupport table. Do not collect with pytest.
+
 Ad-hoc end-to-end check of the step-6 "add" pipeline (techsupport_qa_ingest.py):
 takes one real Slack thread that techsupport_classifier.classify_thread()
 scores as useful + conclusive, runs it through add_verified_qa_pair(), and
@@ -15,8 +18,8 @@ prints everything needed to eyeball correctness:
 The pipeline is product-agnostic (one shared techsupport channel, one shared
 verified-QA store used by both IDA and IDDM) -- there is no product argument.
 
-Usage:
-    python test_techsupport_qa_ingest.py [thread_ts]
+Usage (from LilLisa_Server):
+    python3 smoke/techsupport_qa_ingest.py [thread_ts]
 
 With no args, defaults to the real LDAP/firewall thread already confirmed to
 classify as useful+conclusive (thread_ts 1785094655.495349).
@@ -25,8 +28,9 @@ classify as useful+conclusive (thread_ts 1785094655.495349).
 import sys
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
+SMOKE_DIR = Path(__file__).resolve().parent
+SCRIPTS_DIR = SMOKE_DIR.parent / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
 
 import lancedb  # noqa: E402
 

@@ -1,14 +1,18 @@
 """
 Unit tests for parse_get_ans_result (timeout string must not crash Slack posting).
 
-Run from lil-lisa/src:
-    python3 test_parse_get_ans_result.py
+Run from lil-lisa:
+    PYTHONPATH=src python3 tests/test_parse_get_ans_result.py
 """
 
 import json
+import sys
 import unittest
+from pathlib import Path
 
-from utils import parse_get_ans_result
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from utils import parse_get_ans_result  # noqa: E402
 
 
 class ParseGetAnsResultTests(unittest.TestCase):
