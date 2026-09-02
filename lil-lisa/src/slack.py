@@ -103,7 +103,6 @@ async def _requests_call(func, *args, **kwargs):
 
 
 BOT_USER_ID: str = None
-RERANK_CACHE: Dict[str, List[Dict[str, str]]] = {}
 ESCALATE_ACTION_ID = "escalate_to_techsupport"
 # Dictionary to track which message threads have already been endorsed or escalated
 # Format: {conv_id: {"message_endorsed": True/False, "reaction_endorsed": "up"/"down"/False, "escalated": True/False}}
@@ -770,9 +769,8 @@ async def _post_message_with_fallback(channel_id: str, thread_ts: str, text: str
 async def process_msg(event, say):
     """
     - Call get_ans(...) to get a JSON string like
-      {"response": "...", "reranked_nodes":[{"text":...}, … ]}.
-    - Post only parsed["response"] into Slack.
-    - Cache parsed["reranked_nodes"] under the new message's ts.
+      {"response": "...", "needs_escalation": ..., ...}.
+    - Post only parsed["response"] into Slack (plus escalate UI when configured).
     """
     user_id = event["user"]
     channel_id = event["channel"]
@@ -810,10 +808,9 @@ async def process_msg(event, say):
     # 2) Parsing it as JSON. Timeout/exception paths from get_ans are plain strings.
     parsed = parse_get_ans_result(raw_result)
 
-    # 3) Extract "response", "links_text", "reranked_nodes", and whether this needs escalation
+    # 3) Extract "response", "links_text", and whether this needs escalation
     bot_text = parsed.get("response", "").strip()
     links_text = parsed.get("links_text", "").strip()
-    reranked_nodes = parsed.get("reranked_nodes", [])
     needs_escalation = parsed.get("needs_escalation", False)
     primary_techsupport_match_title = parsed.get("primary_techsupport_match_title")
     logger.debug(
@@ -861,12 +858,12 @@ async def process_msg(event, say):
         blocks = [*base_blocks]
         if techsupport_ready:
             blocks.extend(build_escalation_blocks(button_value, prominent=True))
-        post = await _post_message_with_fallback(
+        await _post_message_with_fallback(
             channel_id=channel_id, thread_ts=orig_thread_ts, text=truncated_bot_text, blocks=blocks
         )
     elif is_expert_answering:
         # A human expert answered directly - no escalation prompt needed.
-        post = await app.client.chat_postMessage(
+        await app.client.chat_postMessage(
             channel=channel_id,
             thread_ts=orig_thread_ts,
             text=truncated_bot_text,
@@ -876,17 +873,9 @@ async def process_msg(event, say):
         blocks = [*base_blocks]
         if techsupport_ready:
             blocks.extend(build_escalation_blocks(button_value, prominent=False))
-        post = await _post_message_with_fallback(
+        await _post_message_with_fallback(
             channel_id=channel_id, thread_ts=orig_thread_ts, text=truncated_bot_text, blocks=blocks
         )
-
-    # 5) Cache reranked_nodes under the bot‐message's ts
-    bot_ts = post["ts"]  # Slack returns a string here
-    if isinstance(reranked_nodes, list) and reranked_nodes:
-        RERANK_CACHE[bot_ts] = reranked_nodes
-        logger.info(f"[CACHE SET] {len(reranked_nodes)} nodes under ts={bot_ts}")
-    else:
-        logger.info(f"[CACHE] No reranked_nodes for ts={bot_ts}")
 
 
 def clear_escalation_claim(conv_id: str) -> None:
@@ -1137,8 +1126,8 @@ async def reaction(event, say):
     1) Ensure we know our BOT_USER_ID.
     2) Handle reactions from experts to ANY message in the thread.
     3) On 👍 from expert, add to golden QA pairs and record endorsement.
-    4) On 👎 from expert to bot messages, unpack reranked_nodes from cache.
-    5) Handle chunk-specific reactions on individual chunk messages.
+    4) On 👍/👎 to bot answers, record endorsement (do not dump retrieved chunks).
+    5) Handle chunk-specific reactions on leftover historical "*Chunk N*" messages.
     """
     await ensure_bot_id()
 
@@ -1215,53 +1204,13 @@ async def reaction(event, say):
             return
 
         # 5) This is a regular bot response message
-        # On 👍: record endorsement for the response
-        if thumbs_up is True:
+        # On 👍/👎: record endorsement. Slack no longer dumps retrieved chunks;
+        # users who need a human should use the tech-support escalate button.
+        if thumbs_up is True or thumbs_up is False:
             await record_endorsement(conv_id, is_expert, thumbs_up, endorsement_type="response")
             await say(channel=channel_id, text="Thank you for your feedback!", thread_ts=conv_id)
             return
 
-        # 6) On 👎: look up RERANK_CACHE[item_ts] and post each node
-        if thumbs_up is False:
-            # First record the negative endorsement for the response
-            await record_endorsement(conv_id, is_expert, thumbs_up, endorsement_type="response")
-
-            #critical
-            logger.info(f"[THUMBS-DOWN] item_ts={item_ts} → cache keys: {list(RERANK_CACHE.keys())}")
-            reranked = RERANK_CACHE.get(item_ts)
-
-            if not reranked:
-                logger.info(f"[NO CACHE] No reranked nodes found for ts={item_ts}")
-                return
-
-            # Find the parent thread_ts so new messages go into that same thread
-            parent_thread = first_msg.get("thread_ts") or first_msg.get("ts")
-
-            # Post each node as a separate message under parent_thread
-            for idx, node in enumerate(reranked, start=1):
-                # 1) Extract the core text
-                chunk_text = node.get("text", "").strip()
-                if not chunk_text:
-                    continue
-
-                # 2) Pull out only the WebPortal URL from metadata (if any)
-                metadata = node.get("metadata", {})
-                webportal_url = metadata.get("webportal_url", "").strip()
-
-                # 3) Create header and use the new truncation function
-                header = f"*Chunk {idx}*\n"
-                message = truncate_message_with_url(chunk_text, webportal_url, header)
-
-                # 4) Post that single, concise message to the same thread
-                logger.info(f"[POST NODE {idx}] thread={parent_thread}, message_length={len(message)}")
-                await app.client.chat_postMessage(
-                    channel=channel_id,
-                    thread_ts=parent_thread,
-                    text=message
-                )
-
-            # Clear that cache entry so no repost it on another 👎
-            del RERANK_CACHE[item_ts]
 
 async def check_members(channel_id, user_id):
     """
