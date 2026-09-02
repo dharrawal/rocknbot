@@ -98,7 +98,9 @@ class LanceDBVectorStore(BasePydanticVectorStore):
 
     stores_text: bool = True
     flat_metadata: bool = True
-    uri: Optional[str] = "/tmp/lancedb"
+    # Upstream llama-index default, kept for parity. Callers here always pass
+    # LANCEDB_FOLDERPATH, so this /tmp path is never actually used.
+    uri: Optional[str] = "/tmp/lancedb"  # nosec B108
     vector_column_name: Optional[str] = "vector"
     nprobes: Optional[int] = 20
     refine_factor: Optional[int] = None
@@ -119,7 +121,8 @@ class LanceDBVectorStore(BasePydanticVectorStore):
 
     def __init__(
         self,
-        uri: Optional[str] = "/tmp/lancedb",
+        # Same upstream default as the class attribute above; always overridden.
+        uri: Optional[str] = "/tmp/lancedb",  # nosec B108
         table_name: Optional[str] = "vectors",
         vector_column_name: str = "vector",
         nprobes: int = 20,
@@ -183,7 +186,8 @@ class LanceDBVectorStore(BasePydanticVectorStore):
 
         if table is not None:
             try:
-                assert isinstance(table, (lancedb.db.LanceTable, lancedb.remote.table.RemoteTable))
+                # Upstream type guard; the except below turns it into a ValueError.
+                assert isinstance(table, (lancedb.db.LanceTable, lancedb.remote.table.RemoteTable))  # nosec B101
                 object.__setattr__(self, "_table", table)
                 object.__setattr__(self, "_table_name", table.name if hasattr(table, "name") else "remote_table")
             except AssertionError:

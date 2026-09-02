@@ -40,7 +40,9 @@ dev = [
     "flake8==6.0.0",
     "pylint==2.16.1",
     "mypy==1.0.0",
-    "bandit[toml]==1.7.4",
+    # 1.7.4 imports pbr.version at runtime but never declares it, so the
+    # bandit step of `make _lint` died with ModuleNotFoundError.
+    "bandit[toml]>=1.8.6",
 ]
 
 [tool.uv]
@@ -62,16 +64,11 @@ disable = ["line-too-long", "import-error", "R0801"]
 ignored-classes = "scoped_session"
 
 [tool.pylint.MASTER]
-# cron/ formats and passes flake8, but pylint and mypy report ~290 and ~73
-# pre-existing findings there (mostly missing docstrings, plus the deliberate
-# ensure_import_paths()-then-import ordering that C0413 dislikes). That is a
-# code-quality project of its own, not a prerequisite for shipping this code.
-ignore-paths = ["^test/FOLDER_TO_IGNORE/.*$", "^cron/.*$"]
+ignore-paths = ["^test/FOLDER_TO_IGNORE/.*$"]
 extension-pkg-whitelist = ["pydantic"]
 
 [tool.mypy]
-# See the note on pylint's ignore-paths above.
-exclude = '(FOLDER_TO_IGNORE|^cron/)'
+exclude = 'FOLDER_TO_IGNORE'
 
 [[tool.mypy.overrides]]
 module = [
@@ -81,4 +78,6 @@ module = [
 ignore_missing_imports = true
 
 [tool.bandit]
-exclude_dirs = ["test"]
+# .venv holds ~4.7M lines of third-party code; without it every run drowned
+# in ~16k findings from dependencies and told us nothing about this project.
+exclude_dirs = ["test", "tests", "./.venv", "./visuals"]

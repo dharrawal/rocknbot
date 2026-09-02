@@ -771,7 +771,8 @@ async def invoke_stream_with_nodes(
             if not available:
                 used_indices.clear()
                 available = list(range(len(THINKING_MESSAGES)))
-            idx = random.choice(available)
+            # Cosmetic "thinking" message selection, not security-relevant.
+            idx = random.choice(available)  # nosec B311
             used_indices.add(idx)
             yield f"COT: {THINKING_MESSAGES[idx]}\n"
             await asyncio.sleep(1.5)
