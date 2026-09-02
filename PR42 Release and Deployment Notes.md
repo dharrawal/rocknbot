@@ -2,7 +2,7 @@
 
 ## 1\. Overview
 
-This adds two things to Rocknbot. First, a real-time escalation flow that lets Lil Lisa post unanswered questions to a tech support channel with one click. Second, a nightly pipeline that automatically turns resolved tech support conversations into verified answers the bots can use going forward, including merging new insight into an existing answer instead of always creating a duplicate. Nothing here requires a new service. It's an extension of `LilLisa_Server` and `lil-lisa`, plus a set of standalone scripts triggered on a schedule.
+This adds two things to Rocknbot. First, a real-time escalation flow that lets Lil Lisa post unanswered questions to a tech support channel with one click. Second, a nightly pipeline that automatically turns resolved tech support conversations into verified answers the bots can use going forward, including merging new insight into an existing answer instead of always creating a duplicate. Nothing here requires a new service, a scheduler, or host access. It's an extension of `LilLisa_Server` and `lil-lisa`: the pipeline ships inside the API image and the API process runs it on its own schedule (Section 5).
 
 ## 2\. New Environment Variables
 
@@ -23,11 +23,11 @@ This adds two things to Rocknbot. First, a real-time escalation flow that lets L
 
 | Variable | Purpose |
 | :---- | :---- |
-| `SLACK_BOT_TOKEN` | Bot token used by the standalone nightly scripts to read the tech support channel. Same bot as `lil-lisa`'s. |
+| `SLACK_BOT_TOKEN` | Bot token the nightly pipeline uses to read the tech support channel. Same bot as `lil-lisa`'s. |
 | `TECHSUPPORT_CHANNEL_ID` | The real tech support channel ID. **Must equal** `lil-lisa`'s `TECHSUPPORT_CHANNEL_ID_IDA` / `_IDDM` / `_IDO` (those three must all be the same ID; the bot raises at startup if they disagree). If you also copy the product-specific names into this file, the pipeline refuses to start when they differ from `TECHSUPPORT_CHANNEL_ID`. |
 | `ADMIN_CHANNEL_ID` | Where pipeline error notifications get posted. |
 
-This is a separate env file from `lil-lisa`'s on purpose, so the nightly scripts can run standalone (for example as their own cron job) without depending on `lil-lisa`'s directory or config existing.
+This is a separate env file from `lil-lisa`'s on purpose, so the pipeline never depends on `lil-lisa`'s directory or config existing — `LilLisa_Server` and `lil-lisa` deploy independently.
 
 ### `LilLisa_Server/cron/env/github_push.env` (dedicated file, new)
 
@@ -44,7 +44,7 @@ This is a separate env file from `lil-lisa`'s on purpose, so the nightly scripts
 | `TECHSUPPORT_CHANNEL_ID_IDDM` | Tech support channel for IDDM. |
 | `TECHSUPPORT_CHANNEL_ID_IDO` | Tech support channel for IDO (optional product). |
 
-In production these must all point to the **same** real channel (one shared tech support channel, not one per product). The bot asserts that at startup. Cron watches only `TECHSUPPORT_CHANNEL_ID` in `techsupport_sync.env`; set that to the same ID.
+In production these must all point to the **same** real channel (one shared tech support channel, not one per product). The bot asserts that at startup. The pipeline watches only `TECHSUPPORT_CHANNEL_ID` in `techsupport_sync.env`; set that to the same ID.
 
 **Important existing variable:** `MAX_LENGTH`: must be 3000 or less, since that's Slack's hard limit on message length. A backup check also exists in case this is ever misconfigured.
 
@@ -52,14 +52,14 @@ In production these must all point to the **same** real channel (one shared tech
 
 - `LilLisa_Server/data/verified_techsupport/techsupport_qa_pairs.md`. The verified techsupport Q\&A source file (markdown). Auto-created and appended by the pipeline, and auto-pushed to GitHub (Section 7\) after every update.  
 - `LilLisa_Server/cron/`. Nightly pipeline Python jobs (see Section 4), shipped in the API image and run by the API process itself — see Section 5. It has no `pyproject.toml` of its own: DSPy is in the server's dependencies and everything shares `LilLisa_Server/.venv`.  
-- `LilLisa_Server/src/techsupport_cron.py`. Adapter that lets the API process run `nightly_pipeline.run_pipeline()`: resolves the cron package, serialises overlapping runs, and provides the optional periodic tick.  
+- `LilLisa_Server/src/techsupport_cron.py`. Adapter that lets the API process run `nightly_pipeline.run_pipeline()`: resolves the cron package, serialises overlapping runs, and provides the periodic tick that `main.lifespan` starts.  
 - `LilLisa_Server/.dockerignore`. Keeps virtualenvs and generated state out of the build context (it was several GB before this existed).  
 - `LilLisa_Server/cron/env/techsupport_sync.env` and `LilLisa_Server/cron/env/github_push.env`. See Section 2\. Both need to be gitignored (already confirmed).  
 - State files, auto-created and gitignored, safe to delete if you want a clean slate since the pipeline will just re-detect everything as new on the next run:  
   - `LilLisa_Server/cron/techsupport_sync_state.json`  
   - `LilLisa_Server/cron/techsupport_reembed_state.json`  
   - `LilLisa_Server/cron/techsupport_review_state.json`  
-  - `LilLisa_Server/scripts/techsupport_thread_tags.json`, written by the running API (`POST /tag_techsupport_thread/`). Cron only reads this file; see Section 4a.
+  - `LilLisa_Server/scripts/techsupport_thread_tags.json`, written by the API request handler (`POST /tag_techsupport_thread/`). The pipeline only reads it; see Section 4a.
 
 ## 4\. Scripts
 
@@ -67,15 +67,15 @@ In production these must all point to the **same** real channel (one shared tech
 | :---- | :---- | :---- |
 | `nightly_pipeline.py` | **Nightly, automatic.** Run by the API process (Section 5); the **only** script that should ever be scheduled. | The main entry point. Orchestrates everything below, including the GitHub push and the live server's index reload. |
 | `nightly_techsupport_sync.py` | Nightly, via `nightly_pipeline.py` | Detects new or updated threads in the tech support channel. New parents come from `conversations.history` since last run. Known threads are not all polled: nightly hot window + periodic 90-day catch-up, both capped (see the `TECHSUPPORT_SYNC_*` knobs in Section 2). |
-| `techsupport_classifier.py` | Nightly, via `nightly_pipeline.py` | Classifies whether a thread is useful and conclusive (DSPy-based |
+| `techsupport_classifier.py` | Nightly, via `nightly_pipeline.py` | Classifies whether a thread is useful and conclusive (DSPy-based). |
 | `techsupport_qa_ingest.py` | Nightly, via `nightly_pipeline.py` | Extracts a summary from a resolved thread and adds it to the markdown file plus LanceDB, or merges it into an existing entry (see Section 4a). |
 | `techsupport_contextual_reembed.py` | Nightly, via `nightly_pipeline.py` (on its own interval) | Periodically re-embeds the whole verified table together (late-chunking), on the interval from Section 2\. |
 | `techsupport_review_sync.py` | Nightly, via `nightly_pipeline.py` | Picks up manual edits an expert might make directly to the markdown file and syncs them into LanceDB. Fully optional, not a gate. |
 | `techsupport_rollback.py` | Manual (ops) | `list_available_versions()` and `rollback_to_version(n)`, see Section 8\. |
 | `github_sync.py` | Nightly, via `nightly_pipeline.py` (or standalone retry) | Pushes the current markdown file to the dedicated GitHub repo. Skips the push if the file hasn't actually changed. Called automatically by `nightly_pipeline.py`, but can also be run standalone if a push needs to be retried manually. |
 | `github_anchor.py` | Library / helper | Generates GitHub-accurate anchor slugs from entry titles, so answers can link directly to the right section of the file on GitHub. |
-| `historical_import_production.py` | **One-shot.** Never cron. Optional: `make run-historical-import`. | One-time bulk import of `data/historical_import/production_1year.txt` into the same verified-techsupport store the nightly pipeline maintains. Resumable; not part of the default schedule. |
-| `backfill_github_urls.py` | **One-shot.** Never cron. Optional: `make run-backfill-github-urls`. | One-time metadata patch: adds `github_url` on existing LanceDB rows that predate the GitHub-anchor feature. New nightly inserts already get this; do not schedule this script. |
+| `historical_import_production.py` | **One-shot, manual.** Never scheduled. Optional: `make run-historical-import`. | One-time bulk import of `data/historical_import/production_1year.txt` into the same verified-techsupport store the nightly pipeline maintains. Resumable; not part of the default schedule. |
+| `backfill_github_urls.py` | **One-shot, manual.** Never scheduled. Optional: `make run-backfill-github-urls`. | One-time metadata patch: adds `github_url` on existing LanceDB rows that predate the GitHub-anchor feature. New nightly inserts already get this; do not schedule this script. |
 
 `nightly_pipeline.py` is the only script that runs on a schedule. Leave `historical_import_production.py` and `backfill_github_urls.py` in `LilLisa_Server/cron/` (do not move them into a one-shot folder); they are invoked by hand only.
 
@@ -185,11 +185,18 @@ GITHUB_REPO_URL=git@github.com:org/repo.git
 
 The script injects credentials via `GIT_ASKPASS` (a short helper that prints `$GITHUB_TOKEN` when Git asks for a username/password). GitHub accepts the PAT as that password. The clone URL logged at INFO is the clean `https://github.com/...` URL with no secret.
 
-4. **The token must live in `github_push.env`.** `github_sync.py` reads that file only. Exporting `GITHUB_TOKEN` in crontab or the process environment is **not** enough if the file is missing or the keys are empty.
+4. **Either the file or the process environment works.** `github_sync.load_env()` reads `github_push.env` and then overlays `os.environ`, so a container/k8s secret wins over an empty placeholder in the file. Supplying both is fine; supplying neither raises `Missing required env var(s) [...] - expected in <path> or the process environment`.
 
-5. Cron does not need extra Git config. The host needs `/bin/sh` (normal Linux runner). A user-level `credential.helper` will not persist this PAT: that clone passes `credential.helper=` so the token is not written to `~/.git-credentials`.
+5. No extra Git config is needed. The image needs `/bin/sh`, which the `python:3.11-slim` base provides. A user-level `credential.helper` will not persist this PAT: that clone passes `credential.helper=` so the token is not written to `~/.git-credentials`.
 
-6. Smoke-check after deploy:
+6. Smoke-check after deploy. Inside the running container (no virtualenv there — dependencies are installed system-wide with `uv pip install --system`):
+
+```
+cd /app/cron
+python github_sync.py
+```
+
+From a dev checkout instead:
 
 ```
 cd LilLisa_Server/cron
@@ -198,19 +205,23 @@ cd LilLisa_Server/cron
 
 Unchanged markdown prints `{'pushed': False, 'reason': 'unchanged'}`. A real change prints `pushed: True` and a commit message. Logs should show `Cloning https://github.com/...` **without** a token in the URL.
 
-**If push fails:** GitHub 401 / `Authentication failed` almost always means the PAT is expired, lacks Contents write, or `GITHUB_REPO_URL` points at the wrong repo. Rotate the token in `github_push.env` only (not in a clone URL). You should not need to change cron or Git's global config.
+**If push fails:** GitHub 401 / `Authentication failed` almost always means the PAT is expired, lacks Contents write, or `GITHUB_REPO_URL` points at the wrong repo. Rotate the token in `github_push.env` (or the process environment), not in a clone URL. You should not need to change Git's global config.
 
 ## 8\. Rollback Procedure
 
-The verified techsupport LanceDB table (`TECHSUPPORT_QA_PAIRS`) keeps full version history. Every re-embed or bulk write creates a new version instead of overwriting in place. If something goes wrong, like a bad re-embed or corrupted data, you can check what's available:
+The verified techsupport LanceDB table (`TECHSUPPORT_QA_PAIRS`) keeps full version history. Every re-embed or bulk write creates a new version instead of overwriting in place. If something goes wrong, like a bad re-embed or corrupted data, you can check what's available.
 
-cd LilLisa_Server/cron
+Run this in the deployed container, since that is where the LanceDB volume is mounted (`python`, not `../.venv/bin/python` — the image installs dependencies system-wide):
 
-../.venv/bin/python \-c "from techsupport_rollback import list_available_versions; list_available_versions()"
+cd /app/cron
+
+python \-c "from techsupport_rollback import list_available_versions; list_available_versions()"
 
 Then roll back to a specific version:
 
-../.venv/bin/python \-c "from techsupport_rollback import rollback_to_version; rollback_to_version(N)"
+python \-c "from techsupport_rollback import rollback_to_version; rollback_to_version(N)"
+
+On a dev checkout the same commands work with `cd LilLisa_Server/cron` and `../.venv/bin/python`.
 
 This is non-destructive. Rolling back creates a new version rather than deleting anything, so you can always move forward or backward again afterward.
 
