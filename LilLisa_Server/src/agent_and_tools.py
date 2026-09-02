@@ -620,7 +620,10 @@ def answer_from_document_retrieval(
             result = document_retriever.retrieve(query)
             utils.logger.debug("PERF | retrieve_documents | %.3fs", time.perf_counter() - t0)
             return result
-        except Warning:
+        except Exception:
+            # Fail closed (no doc results) rather than crashing the whole
+            # answer if document retrieval is unavailable or misconfigured.
+            utils.logger.exception("Document retrieval failed")
             utils.logger.debug("PERF | retrieve_documents | %.3fs", time.perf_counter() - t0)
             return []
 
