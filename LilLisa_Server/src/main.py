@@ -73,6 +73,7 @@ from src.llama_index_lancedb_vector_store import LanceDBVectorStore
 from src.llama_index_markdown_reader import MarkdownReader
 
 from src.techsupport_thread_tags import THREAD_TAGS_LOCK, upsert_thread_tag
+from src import techsupport_cron
 from src import observability
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
@@ -552,8 +553,11 @@ async def lifespan(_app: FastAPI):
         await init_lance_databases()
     else:
         create_lancedb_retrievers_and_indices(LANCEDB_FOLDERPATH)
-    
+
+    pipeline_scheduler_task = techsupport_cron.start_scheduler()
+
     yield
+    await techsupport_cron.stop_scheduler(pipeline_scheduler_task)
     os.unsetenv("OPENAI_API_KEY")
     os.unsetenv("VOYAGE_API_KEY")
     litellm.api_key = None
@@ -1184,7 +1188,7 @@ async def reload_techsupport_qa_pairs(encrypted_key: str) -> dict:
     Rebuilds the in-memory QA pairs retrievers/indices (including
     TECHSUPPORT_QA_PAIRS) from the current on-disk LanceDB tables.
 
-    lil-lisa-cron-scripts/nightly_pipeline.py and techsupport_qa_ingest.py write new
+    cron/nightly_pipeline.py and techsupport_qa_ingest.py write new
     verified techsupport entries directly to LanceDB, entirely out-of-process
     from this server -- unlike add_expert_qa_pair above, which is called from
     within a running request here. Without this endpoint, a long-running
@@ -1218,7 +1222,45 @@ async def reload_techsupport_qa_pairs(encrypted_key: str) -> dict:
         raise HTTPException(status_code=500, detail="Internal error in reload_techsupport_qa_pairs()") from exc
 
 
-# Written here by this API process. lil-lisa-cron-scripts reads the same path
+@app.post("/run_nightly_pipeline/", response_model=str, response_class=PlainTextResponse)
+async def run_nightly_pipeline(encrypted_key: str, background_tasks: BackgroundTasks) -> str:
+    """
+    Runs cron/nightly_pipeline.py in this process, in the background.
+
+    Same code host cron runs; this is the trigger for deployments where the API
+    image is the only thing shipped (no host access, no second container). An
+    external scheduler can POST here on a timer, and ops can POST manually to
+    force a run. The pipeline is self-gating on TECHSUPPORT_SYNC_INTERVAL_HOURS,
+    so an extra call is cheap rather than harmful.
+
+    Overlapping calls are dropped rather than queued -- see techsupport_cron.run_once.
+
+    Args:
+        encrypted_key (str): JWT key for authentication.
+        background_tasks (BackgroundTasks): FastAPI background task manager.
+
+    Returns:
+        str: Immediate confirmation message (the run itself takes minutes).
+    """
+    try:
+        jwt.decode(encrypted_key, AUTHENTICATION_KEY, algorithms="HS256")
+    except jwt.exceptions.InvalidSignatureError as e:
+        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
+
+    if not techsupport_cron.is_available():
+        utils.logger.error(
+            "run_nightly_pipeline() requested but the cron package is unavailable: %s", techsupport_cron.IMPORT_ERROR
+        )
+        raise HTTPException(status_code=503, detail="Nightly techsupport pipeline is not installed in this image.")
+
+    if techsupport_cron.is_running():
+        return "Nightly techsupport pipeline is already running. This request was ignored."
+
+    background_tasks.add_task(techsupport_cron.run_once)
+    return "Nightly techsupport pipeline initiated. Progress and the run summary are in the server logs."
+
+
+# Written here by this API process. The cron/ jobs read the same path
 # (paths.THREAD_TAGS_PATH); do not move this file into the cron package.
 TECHSUPPORT_THREAD_TAGS_PATH = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "techsupport_thread_tags.json"
 

@@ -26,6 +26,11 @@ dependencies = [
     "opentelemetry-instrumentation-fastapi==0.54b0",
     "opentelemetry-exporter-otlp==1.33.0",
     "voyageai==0.3.4",
+    # cron/ (nightly techsupport pipeline) runs both standalone and in this
+    # process via src/techsupport_cron.py, so its deps ship here rather than in
+    # a second venv.
+    "dspy>=2.6.27",
+    "requests>=2.31,<3",
 ]
 
 [project.optional-dependencies]
@@ -57,11 +62,16 @@ disable = ["line-too-long", "import-error", "R0801"]
 ignored-classes = "scoped_session"
 
 [tool.pylint.MASTER]
-ignore-paths = ["^test/FOLDER_TO_IGNORE/.*$"]
+# cron/ formats and passes flake8, but pylint and mypy report ~290 and ~73
+# pre-existing findings there (mostly missing docstrings, plus the deliberate
+# ensure_import_paths()-then-import ordering that C0413 dislikes). That is a
+# code-quality project of its own, not a prerequisite for shipping this code.
+ignore-paths = ["^test/FOLDER_TO_IGNORE/.*$", "^cron/.*$"]
 extension-pkg-whitelist = ["pydantic"]
 
 [tool.mypy]
-exclude = 'FOLDER_TO_IGNORE'
+# See the note on pylint's ignore-paths above.
+exclude = '(FOLDER_TO_IGNORE|^cron/)'
 
 [[tool.mypy.overrides]]
 module = [

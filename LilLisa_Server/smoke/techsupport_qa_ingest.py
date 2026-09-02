@@ -19,7 +19,7 @@ The pipeline is product-agnostic (one shared techsupport channel, one shared
 verified-QA store used by both IDA and IDDM) -- there is no product argument.
 
 Usage (from LilLisa_Server, with cron scripts on PYTHONPATH):
-    PYTHONPATH=../lil-lisa-cron-scripts python3 smoke/techsupport_qa_ingest.py [thread_ts]
+    PYTHONPATH=cron python3 smoke/techsupport_qa_ingest.py [thread_ts]
 
 With no args, defaults to the real LDAP/firewall thread already confirmed to
 classify as useful+conclusive (thread_ts 1785094655.495349).
@@ -29,7 +29,7 @@ import sys
 from pathlib import Path
 
 SMOKE_DIR = Path(__file__).resolve().parent
-SCRIPTS_DIR = SMOKE_DIR.parent.parent / "lil-lisa-cron-scripts"
+SCRIPTS_DIR = SMOKE_DIR.parent / "cron"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import lancedb  # noqa: E402

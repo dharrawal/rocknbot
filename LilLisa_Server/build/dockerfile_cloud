@@ -25,6 +25,9 @@ COPY env /app/env
 COPY passwords /app/passwords
 COPY src /app/src
 
+# Nightly techsupport pipeline, run in-process by src/techsupport_cron.py.
+COPY cron /app/cron
+
 RUN mkdir speedict
 
 ENV PYTHONUNBUFFERED=1

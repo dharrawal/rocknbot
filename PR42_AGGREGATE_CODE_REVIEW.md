@@ -162,6 +162,7 @@ Customer/employee questions and model output land in production logs. `DEBUG_NO_
 Nothing under `src/` imports `dspy`. It is used by pipeline scripts. Putting it in default `dependencies` (and large `uv.lock` churn) bloats the API image. Prefer an optional extra (`[project.optional-dependencies] pipeline`) or a separate scripts package.
 
 - **Done:** Moved pipeline jobs to top-level `lil-lisa-cron-scripts/` with its own `pyproject.toml` (`dspy>=2.6.27` + path dep on `LilLisa_Server`). Removed `dspy` from `LilLisa_Server` default dependencies and regenerated `uv.lock` (DSPy and related packages dropped from the API lock). Cron: `make setup-env` then `python nightly_pipeline.py`. Thread tags stay at `LilLisa_Server/scripts/techsupport_thread_tags.json` (API writes them). Tests: `lil-lisa-cron-scripts/tests/`.
+- **Superseded (deployment rework):** The split was reversed. The jobs now live at `LilLisa_Server/cron/` with no `pyproject.toml` of their own, `dspy>=2.6.27` is back in the server's default dependencies, and the API image ships and runs them (`src/techsupport_cron.py`). The original image-bloat concern did not hold up once measured: DSPy adds ~21 mostly pure-Python packages to an image that already ships `torch` with CUDA wheels. In exchange, the deployment needs no host access, no second image, and no shared volume between containers, and there is only one virtualenv to build. See Section 5 of the deploy notes.
 - **Beads:** `pr42-hp.3.1` **closed**.
 
 **Blocking `requests` on the Bolt async loop** (`pr42-hp.3.2`)  
@@ -187,13 +188,13 @@ Restart clears `escalated`. Bot talks again in the original thread; users can es
 `**configure_dspy_lm()` at import time** (`pr42-hp.4.3`)  
 `techsupport_classifier.py` and `techsupport_qa_ingest.py` call it at module load. Importing `nightly_pipeline` requires LLM key files even for `--help` or unit-test parsers. Configure lazily inside `classify_thread` / summarize.
 
-- **Done:** Idempotent lazy `configure_dspy_lm()`; called from `classify_thread`, `generate_verified_title_and_summary`, `enrich_verified_entry`, `historical_import.convert_entry`, and `historical_revert_to_prose._generate_title_with_retry`. Module-level calls removed. Tests: `lil-lisa-cron-scripts/tests/test_lazy_dspy_configure.py`.
+- **Done:** Idempotent lazy `configure_dspy_lm()`; called from `classify_thread`, `generate_verified_title_and_summary`, `enrich_verified_entry`, `historical_import.convert_entry`, and `historical_revert_to_prose._generate_title_with_retry`. Module-level calls removed. Tests: `LilLisa_Server/cron/tests/test_lazy_dspy_configure.py`.
 - **Beads:** `pr42-hp.4.3` **closed**. Parent RELIABILITY epic `pr42-hp.4` **closed**.
 
 `**github_sync.load_env` ignores `os.environ**` (`pr42-hp.4.4`)  
 Every other script does dotenv then overlay env. Cron/`GITHUB_TOKEN` in the environment will be ignored if the file is empty. Inconsistent and surprising in deploy.
 
-- **Done:** Same `{**dotenv_values(...), **os.environ}` overlay as `nightly_techsupport_sync.load_env`. Empty file placeholders no longer shadow a real process-env token. Tests: `lil-lisa-cron-scripts/tests/test_github_sync.py`.
+- **Done:** Same `{**dotenv_values(...), **os.environ}` overlay as `nightly_techsupport_sync.load_env`. Empty file placeholders no longer shadow a real process-env token. Tests: `LilLisa_Server/cron/tests/test_github_sync.py`.
 - **Beads:** `pr42-hp.4.4` **closed**.
 
 ### INSTRUMENTATION (`pr42-hp.5`)
@@ -263,7 +264,7 @@ Nightly insert uses Voyage `input_type="query"` (same as `VoyageEmbedding._get_t
 `**##` in generated titles/summaries breaks the parser** (`pr42-mp.1.9`)  
 `parse_summary_markdown` splits on `^##`. Prompt says not to use `#` in titles; models still do. Sanitize (strip heading markers; indent `##` in body).
 
-- **Done:** `techsupport_markdown.py` strips `#` from titles and indents body lines that start with `##`. Called on generate / add / replace / enrich. Tests: `lil-lisa-cron-scripts/tests/test_techsupport_markdown.py`.
+- **Done:** `techsupport_markdown.py` strips `#` from titles and indents body lines that start with `##`. Called on generate / add / replace / enrich. Tests: `LilLisa_Server/cron/tests/test_techsupport_markdown.py`.
 - **Beads:** `pr42-mp.1.9` **closed**.
 
 **Enrich matches title exactly; first hit wins** (`pr42-mp.1.10`)  
@@ -315,7 +316,7 @@ No `raise_for_status()`. Failed tags look successful; nightly ingest will create
 `**enriched` omitted from the summary log line** (`pr42-mp.5.1`)  
 `counts` tracks `enriched` (and GitHub push / reload use it). The `logger.info` pipeline summary and the admin-alert string include `replaced` but not `enriched`. An enrich-only night looks like `added=0 replaced=0`.
 
-- **Done:** `format_pipeline_counts()` in `lil-lisa-cron-scripts/pipeline_summary.py` renders all counts (`enriched` after `added`). Shared by the INFO summary and the admin-alert parenthetical in `nightly_pipeline.py`. Unknown keys are appended sorted. Tests: `lil-lisa-cron-scripts/tests/test_format_pipeline_counts.py`.
+- **Done:** `format_pipeline_counts()` in `LilLisa_Server/cron/pipeline_summary.py` renders all counts (`enriched` after `added`). Shared by the INFO summary and the admin-alert parenthetical in `nightly_pipeline.py`. Unknown keys are appended sorted. Tests: `LilLisa_Server/cron/tests/test_format_pipeline_counts.py`.
 - **Beads:** `pr42-mp.5.1` **closed**. Parent INSTRUMENTATION epic `pr42-mp.5` **closed**.
 
 ### MISC (`pr42-mp.6`)
@@ -359,7 +360,7 @@ Harmless if you have local harvest tools; otherwise it is a dead ignore. Short c
 `**GITHUB_TOKEN=ghp_your-personal-access-token-here` looks like a real PAT prefix** (`pr42-lp.2.2`)  
 Some scanners flag `ghp_`. Use `GITHUB_TOKEN=` plus a comment.
 
-- **Done:** `lil-lisa-cron-scripts/env/github_push.env.example` uses empty `GITHUB_TOKEN=` plus a header comment. No `ghp_` prefix.
+- **Done:** `LilLisa_Server/cron/env/github_push.env.example` uses empty `GITHUB_TOKEN=` plus a header comment. No `ghp_` prefix.
 - **Beads:** `pr42-lp.2.2` **closed**.
 
 `**AUTHENTICATION_KEY` / `JWT_SECRET_KEY` in the server example** (`pr42-lp.2.3`)  
@@ -389,7 +390,7 @@ Rolling LanceDB back without the file will drift. Document “restore md + state
 **Classifier `Literal["yes", "no"]` equality is brittle** (`pr42-lp.4.3`)  
 If the model returns `Yes` / `yes.`, comparison fails. Normalize.
 
-- **Done:** `is_yes_answer()` in `techsupport_classifier.py` treats yes/no case-insensitively (punctuation stripped); unknown stays `False`. Tests: `lil-lisa-cron-scripts/tests/test_techsupport_classifier_yes_no.py`.
+- **Done:** `is_yes_answer()` in `techsupport_classifier.py` treats yes/no case-insensitively (punctuation stripped); unknown stays `False`. Tests: `LilLisa_Server/cron/tests/test_techsupport_classifier_yes_no.py`.
 - **Beads:** `pr42-lp.4.3` **closed**. Parent RELIABILITY epic `pr42-lp.4` **closed**.
 
 ### INSTRUMENTATION (`pr42-lp.5`) — **closed** (no children)
@@ -401,7 +402,7 @@ None beyond the IDO-missing-warn aspect of the Feature item above.
 **One gitignore line per state filename will keep growing** (`pr42-lp.6.1`)  
 A pattern such as `scripts/*_state.json` plus an explicit `techsupport_thread_tags.json` would absorb later state files automatically.
 
-- **Done:** `lil-lisa-cron-scripts/.gitignore` uses `*_state.json`. Thread tags stay name-specific on the server (`LilLisa_Server/scripts/techsupport_thread_tags.json`).
+- **Done:** `LilLisa_Server/cron/.gitignore` uses `*_state.json`. Thread tags stay name-specific on the server (`LilLisa_Server/scripts/techsupport_thread_tags.json`).
 - **Beads:** `pr42-lp.6.1` **closed**.
 
 **Inconsistent `KEY = value` vs `KEY=value` in examples** (`pr42-lp.6.2`)  
@@ -414,6 +415,7 @@ Harmless for python-dotenv; slightly annoying to copy.
 `backfill_github_urls.py` / `historical_import_production.py` should stay out of the default cron (README/makefile target that is *not* `nightly_pipeline`).
 
 - **Done:** Deploy notes §4 and `lil-lisa-cron-scripts/makefile`: `run-nightly` is the only cron target; historical import and GitHub URL backfill are optional one-shot make targets, never cron.
+- **Superseded (deployment rework):** There is no crontab at all now — the API process schedules `nightly_pipeline.py` itself on a tick, and `POST /run_nightly_pipeline/` forces a run. The underlying point still holds and is still enforced: `nightly_pipeline.py` is the only thing that ever runs on a schedule, and `historical_import_production.py` / `backfill_github_urls.py` remain manual make targets in `LilLisa_Server/cron/`.
 - **Beads:** `pr42-lp.6.3` **closed**. Parent MISC epic `pr42-lp.6` **closed**. Parent epic `pr42-lp` **closed**.
 
 ---
@@ -476,7 +478,7 @@ None beyond items already listed at Low/High.
 `**GithubAnchorSlugger` increment-from-zero** (`pr42-nits.6.1`)  
 Stores `result` with count `0` then increments `base`. Worth a unit test against github-slugger fixtures (some live README checks were done; encode those as tests).
 
-- **Done:** Algorithm unchanged. Unit tests in `lil-lisa-cron-scripts/tests/test_github_anchor.py`.
+- **Done:** Algorithm unchanged. Unit tests in `LilLisa_Server/cron/tests/test_github_anchor.py`.
 - **Beads:** `pr42-nits.6.1` **closed**. Parent MISC epic `pr42-nits.6` **closed**. Parent epic `pr42-nits` **closed**.
 
 ---

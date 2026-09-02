@@ -33,7 +33,7 @@ VENV_BIN = .venv/bin
 _lint:
 	$(VENV_BIN)/isort .
 	$(VENV_BIN)/black .
-	$(VENV_BIN)/flake8 . --ignore E501,E122,W503,E402
+	$(VENV_BIN)/flake8 . --ignore E501,E122,W503,E402 --exclude .venv
 	$(VENV_BIN)/pylint --recursive=y .
 	$(VENV_BIN)/mypy --install-types --non-interactive .
 	$(VENV_BIN)/mypy .

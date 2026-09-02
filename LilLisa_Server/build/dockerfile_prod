@@ -23,6 +23,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY data /app/data
 COPY src /app/src
 
+# Nightly techsupport pipeline, run in-process by src/techsupport_cron.py.
+COPY cron /app/cron
+
 RUN mkdir speedict
 
 ENV PYTHONUNBUFFERED=1

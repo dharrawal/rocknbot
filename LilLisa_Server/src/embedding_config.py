@@ -5,7 +5,7 @@ Standalone embedding configuration, extracted out of src/main.py so it can be
 imported without dragging in the whole FastAPI app (routes, lifespan startup,
 GitHub cloning, etc.). Anything that needs to embed text the same way the
 server's CONTEXTUAL chunking strategy does -- main.py itself, or standalone
-scripts like lil-lisa-cron-scripts/techsupport_qa_ingest.py -- should import from here
+scripts like cron/techsupport_qa_ingest.py -- should import from here
 instead of redefining this class.
 
 VoyageEmbedding wraps Voyage AI's voyage-context-3 model. It requires the
