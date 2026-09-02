@@ -44,6 +44,7 @@ ever DOES contain such a character, its slug (and only that one entry's
 link) could be wrong.
 """
 
+import os
 import re
 import unicodedata
 from pathlib import Path
@@ -123,11 +124,18 @@ def parse_org_repo(repo_url: str) -> str:
 def load_github_repo_url() -> str:
     """Reads GITHUB_REPO_URL from cron/env/github_push.env -- the same
     file github_sync.py reads GITHUB_TOKEN/GITHUB_REPO_URL from (only the
-    repo URL is needed here; no token, since this only builds link text)."""
-    env = dict(dotenv_values(str(ENV_PATH)))
+    repo URL is needed here; no token, since this only builds link text).
+
+    Overlays os.environ exactly as github_sync.load_env() does, so a
+    deployment that ships an empty placeholder file and injects the real
+    value as an env var (the prod image copies no env/, see
+    build/dockerfile_prod) gets links instead of silently getting none --
+    both callers treat a failure here as advisory and fall back to no
+    github_url."""
+    env = {**dict(dotenv_values(str(ENV_PATH))), **os.environ}
     repo_url = env.get("GITHUB_REPO_URL")
     if not repo_url:
-        raise RuntimeError(f"GITHUB_REPO_URL not found in {ENV_PATH}")
+        raise RuntimeError(f"GITHUB_REPO_URL not found in {ENV_PATH} or the process environment")
     return repo_url
 
 

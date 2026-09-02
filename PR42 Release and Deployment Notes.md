@@ -48,6 +48,26 @@ In production these must all point to the **same** real channel (one shared tech
 
 **Important existing variable:** `MAX_LENGTH`: must be 3000 or less, since that's Slack's hard limit on message length. A backup check also exists in case this is ever misconfigured.
 
+### 2a. How these files reach the container
+
+The tables above describe files in the repo. Whether those files are *inside* the image depends on which dockerfile built it, and the three differ on purpose:
+
+| Image | `env/` + `passwords/` | Built by |
+| :---- | :---- | :---- |
+| `dockerfile_local`, `dockerfile_cloud` | `COPY env /app/env` and `COPY passwords /app/passwords` — baked in | `make build-local` / `make build-cloud`, from your working copy |
+| `dockerfile_prod` | **Neither is copied** — supply at runtime | `.github/workflows/ci.yaml`, published as `radiantone/rocknbot-server:staging` |
+
+`dockerfile_prod` omits them deliberately: CI builds it from a clean checkout where both are gitignored, and it gets pushed to a registry, so it must contain no secrets. That means a prod deployment has to supply the configuration itself, either way round:
+
+- **Mount the directories** at `/app/env` and `/app/passwords`. This is the closest match to the tables above and to how local/cloud behave.
+- **Inject environment variables.** Every config loader in `src/` and `cron/` reads its `.env` file and then overlays `os.environ`, so a real env var beats a missing file or an empty placeholder in it. This covers `lillisa_server.env`, `cron/env/techsupport_sync.env`, and `cron/env/github_push.env` alike.
+
+The one thing injection alone cannot replace is the key files. `LLM_API_KEY_FILEPATH`, `OPENAI_API_KEY_FILEPATH`, and `VOYAGE_API_KEY_FILEPATH` name *paths*, and `main.lifespan` reads each file at startup — a missing one raises `FileNotFoundError` and the container never serves. So even under injection, the key files must exist at whatever paths those variables point to.
+
+This fails fast and loudly at boot rather than degrading, so a misconfigured prod container is obvious immediately. It is not a nightly-pipeline problem: because startup demands strictly more configuration than the pipeline does, a container that is serving traffic has everything the pipeline needs.
+
+**Do not hand-build the prod image on a dev box.** `COPY cron /app/cron` picks up whatever is in `cron/env/` in the build context, and `.dockerignore` does not exclude it (local and cloud rely on those files being present). Building `dockerfile_prod` from a working copy that has real credentials there would bake `SLACK_BOT_TOKEN` and `GITHUB_TOKEN` into an image that is otherwise secret-free. CI is unaffected — it clones fresh, and both files are gitignored.
+
 ## 3\. New Files and Directories
 
 - `LilLisa_Server/data/verified_techsupport/techsupport_qa_pairs.md`. The verified techsupport Q\&A source file (markdown). Auto-created and appended by the pipeline, and auto-pushed to GitHub (Section 7\) after every update.  
@@ -102,7 +122,7 @@ The three API dockerfiles `COPY cron /app/cron`, and `LilLisa_Server/pyproject.t
 
 Because `cron/` lives inside the server tree, `paths.py` resolves the server root as its own parent — `/app/cron` → `/app` in the image, and the checkout path on a dev box. No env var is needed for either.
 
-**Build context.** Unchanged (`LilLisa_Server/`), but a new `LilLisa_Server/.dockerignore` is now required: it keeps `.venv`, `speedict/`, and generated state out of the build, which took the context from ~7.3 GB down to ~179 MB (almost all of the remainder is `lancedb/`, deliberately kept because `dockerfile_lancedb` copies it).
+**Build context.** Unchanged (`LilLisa_Server/`), but a new `LilLisa_Server/.dockerignore` is now required: it keeps `.venv`, `speedict/`, and generated state out of the build, which took the context from ~7.3 GB down to ~179 MB (almost all of the remainder is `lancedb/`, deliberately kept because `dockerfile_lancedb` copies it). What each image does and does not carry out of that context differs — see Section 2a before building or deploying `dockerfile_prod`.
 
 ### 5a. How the schedule works
 
@@ -139,7 +159,7 @@ The pipeline's state files (`techsupport_sync_state.json`, `techsupport_reembed_
 
 If you have pipeline state JSON under the old `LilLisa_Server/scripts/` or `lil-lisa-cron-scripts/` location, copy it into `LilLisa_Server/cron/` before first run. Leave `techsupport_thread_tags.json` where the API writes it (`LilLisa_Server/scripts/`).
 
-**Secrets.** `env/techsupport_sync.env` and `env/github_push.env` live under the cron package (`/app/cron/env/`) and are gitignored, so supply them the same way `passwords/` is supplied in your deployment. Without them the tick logs a clear `Missing required env var(s)` error each time and does nothing else.
+**Secrets.** `env/techsupport_sync.env` and `env/github_push.env` live under the cron package (`/app/cron/env/`) and are gitignored, so supply them the same way `passwords/` is supplied in your deployment — mounted, or injected as environment variables (see Section 2a). Without them the tick logs a clear `Missing required env var(s)` error each time and does nothing else.
 
 Since the pipeline runs in the same process as the API, `LIL_LISA_SERVER_URL` keeps its `http://127.0.0.1:8000` default — the index reload call is to itself.
 

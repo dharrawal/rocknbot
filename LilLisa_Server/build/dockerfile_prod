@@ -19,7 +19,14 @@ COPY pyproject.toml /app/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu126 .
 
-# Copy the app code and files to the container
+# Copy the app code and files to the container.
+# Deliberately NOT copied here (unlike dockerfile_local / dockerfile_cloud):
+# env/ and passwords/. This image is built by CI from a clean checkout, where
+# both are gitignored, and is published to a registry -- it must ship no
+# secrets. A prod deployment has to mount /app/env + /app/passwords, or inject
+# the *_API_KEY_FILEPATH vars with the key files mounted at those paths;
+# src/main.py's lifespan requires each of those files to exist and fails fast
+# at startup otherwise.
 COPY data /app/data
 COPY src /app/src
 
