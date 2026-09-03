@@ -29,6 +29,7 @@ from escalation_tracker import (
     is_escalation_active,
 )
 from utils import (
+    ESCALATE_VALUE_QUERY_MAX_LENGTH,
     assert_shared_techsupport_channel_ids,
     build_escalation_button_value,
     logger,
