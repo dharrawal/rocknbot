@@ -18,6 +18,8 @@ LilLisa Server uses LanceDB as the vector database, providing blazingly fast ret
 
 LilLisa Server is able to grow its knowledge base and get better at answering user questions as more documentation is added and conversations are stored.
 
+Two of those sources need no human upkeep. A nightly pipeline turns resolved tech support threads into verified answers, and it also scans the product channels for corrections: when a product expert replies to one of Lil Lisa's answers to fix or extend it, that reply either rewrites the entry the answer came from or becomes a new one. Configuration, scheduling and ops detail are in "PR42 Release and Deployment Notes.md" at the root of this repo.
+
 # RAG Retrieval Experimentation Code
 
 Zipped folder containing code that was used to evaluate the retrieval techniques.

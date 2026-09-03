@@ -80,6 +80,23 @@ and product-specific ticket keys still need a real techsupport_qa_pairs.md
 to tune -- see beads pr42-blockers.2.3. The summarize/merge prompts also
 ask the model to omit that material; regex is the backstop.
 
+Routing rule for an incoming classified thread (nightly_pipeline.py decides,
+this module supplies the three entry points):
+  * A CORRECTION thread -- an expert replying in a product channel to say a
+    cited verified entry is wrong -- goes to correct_verified_entry(), which
+    SUPERSEDES: contradicted content is dropped/rewritten in the expert's
+    favor (CorrectTechsupportSummary).
+  * An ESCALATION thread tagged as related to an existing entry via
+    /tag_techsupport_thread/ goes to enrich_verified_entry(), which APPEND
+    MERGES: existing content is preserved and the new insight added
+    (MergeTechsupportSummaries).
+  * A thread with no cited/tracked entry (or whose cited title no longer
+    exists, i.e. either call above raised LookupError) falls back to
+    add_verified_qa_pair(), a brand-new entry.
+Both update paths reuse the existing title verbatim so the GitHub anchor stays
+stable, and record provenance (source channel/thread + timestamp) under
+"corrections"/"enrichments" in techsupport_review_state.json.
+
 Required env vars (read from ../env/lillisa_server.env, same file the main
 server reads):
     LANCEDB_FOLDERPATH      - path (relative to LilLisa_Server project root) to the LanceDB folder
@@ -95,6 +112,7 @@ Usage (as a library):
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -106,6 +124,7 @@ from paths import (
     LILLISA_SERVER_ENV_PATH,
     LILLISA_SERVER_ROOT,
     PACKAGE_ROOT,
+    ANSWER_TAGS_PATH,
     THREAD_TAGS_PATH,
     ensure_import_paths,
 )
@@ -128,6 +147,7 @@ from techsupport_pii import redact_obvious_pii  # noqa: E402
 from techsupport_review_state import (  # noqa: E402
     node_ids_from_review_entry,
     review_entry_state,
+    with_provenance,
 )
 
 from atomic_io import atomic_write_json, atomic_write_text  # noqa: E402
@@ -185,6 +205,14 @@ REVIEW_STATE_PATH = SCRIPT_DIR / "techsupport_review_state.json"
 # should be merged into that existing entry (enrich_verified_entry) instead
 # of added as a new one.
 # THREAD_TAGS_PATH is defined in paths.py (LilLisa_Server/scripts/).
+#
+# Its twin, ANSWER_TAGS_PATH (also paths.py), is the local, git-ignored map of
+# {session_id: cited_entry_title} that src/main.py's invoke() writes whenever
+# an answer's top reranked node was a verified techsupport entry. session_id is
+# the Slack thread ts, so get_cited_entry_title() below can ask "did the bot's
+# answer in this product-channel thread cite a verified entry?" -- which is what
+# nightly_pipeline.py's product-channel pass uses to route an expert reply to
+# correct_verified_entry() (supersede) instead of add_verified_qa_pair().
 
 
 def load_review_state() -> Dict[str, Any]:
@@ -203,6 +231,16 @@ def get_related_entry_title(thread_ts: str) -> Optional[str]:
     if not THREAD_TAGS_PATH.exists():
         return None
     with open(THREAD_TAGS_PATH, "r", encoding="utf-8") as file:
+        tags = json.load(file)
+    return tags.get(thread_ts)
+
+
+def get_cited_entry_title(thread_ts: str) -> Optional[str]:
+    """Return the title of the verified entry the bot's answer in this thread cited
+    (recorded at answer time by invoke()), or None if the answer cited none."""
+    if not ANSWER_TAGS_PATH.exists():
+        return None
+    with open(ANSWER_TAGS_PATH, "r", encoding="utf-8") as file:
         tags = json.load(file)
     return tags.get(thread_ts)
 
@@ -280,7 +318,10 @@ class SummarizeConversationThread(dspy.Signature):
             "enough to be useful for similar future issues. Write it as standalone prose -- "
             "do not frame it as a question/answer pair, and do not reference the Slack "
             "thread, usernames, timestamps, or the fact this came from a conversation. "
-            "Omit emails, hostnames, IP addresses, ticket IDs, tenant/customer names, and secrets."
+            "Omit emails, hostnames, IP addresses, ticket IDs, tenant/customer names, and secrets. "
+            "Content from a speaker tagged '(bot)' is AI-generated and unverified, so where a later "
+            "message from a speaker tagged '(expert)' corrects it, the expert's version is "
+            "authoritative and supersedes the bot's content."
         )
     )
 
@@ -317,7 +358,33 @@ class MergeTechsupportSummaries(dspy.Signature):
             "self-contained technical summary, standalone prose, not a question/answer pair, "
             "and do not reference the Slack thread, usernames, timestamps, or the fact this "
             "came from a conversation. Omit emails, hostnames, IP addresses, ticket IDs, "
-            "tenant/customer names, and secrets."
+            "tenant/customer names, and secrets. "
+            "Content from a speaker tagged '(bot)' is AI-generated and unverified, so where a later "
+            "message from a speaker tagged '(expert)' corrects it, the expert's version is "
+            "authoritative and supersedes the bot's content."
+        )
+    )
+
+
+class CorrectTechsupportSummary(dspy.Signature):
+    """Given an existing verified technical support summary and a conversation in
+    which a human expert states that it is wrong, produce a corrected summary.
+    This is a supersede, not a merge/append: content the expert contradicts must
+    NOT survive into the corrected summary."""
+
+    existing_summary: str = dspy.InputField()
+    correction_thread: str = dspy.InputField()
+    corrected_summary: str = dspy.OutputField(
+        desc=(
+            "The existing summary rewritten so that anything the expert contradicts is "
+            "removed or replaced with the expert's version, and everything the expert did "
+            "not contradict is kept unchanged. Content from a speaker tagged '(expert)' is "
+            "authoritative; content from a speaker tagged '(bot)' is AI-generated and "
+            "unverified, so where the two disagree the expert wins and the bot's version "
+            "must be dropped. Write it as a single self-contained technical summary, "
+            "standalone prose, not a question/answer pair, and do not reference the Slack "
+            "thread, usernames, timestamps, or the fact this came from a conversation. "
+            "Omit emails, hostnames, IP addresses, ticket IDs, tenant/customer names, and secrets."
         )
     )
 
@@ -325,6 +392,7 @@ class MergeTechsupportSummaries(dspy.Signature):
 summarize_conversation = dspy.Predict(SummarizeConversationThread)
 generate_title = dspy.Predict(GenerateTechsupportTitle)
 merge_techsupport_summaries = dspy.Predict(MergeTechsupportSummaries)
+correct_summary = dspy.Predict(CorrectTechsupportSummary)
 
 
 def generate_verified_title_and_summary(conversation_thread: str) -> Dict[str, str]:
@@ -540,7 +608,9 @@ def add_verified_qa_pair(conversation_thread: str, thread_ts: Optional[str] = No
     lancedb_result = insert_summary_into_lancedb(title, summary, github_url=github_url)
 
     review_state = load_review_state()
-    review_state["entries"][str(entry_index)] = {"node_ids": lancedb_result["node_ids"], "thread_ts": thread_ts}
+    review_state["entries"][str(entry_index)] = with_provenance(
+        review_entry_state(review_state, entry_index), lancedb_result["node_ids"], thread_ts
+    )
     save_review_state(review_state)
 
     return {
@@ -614,7 +684,9 @@ def replace_verified_qa_pair(thread_ts: str, conversation_thread: str) -> Dict[s
     github_url = _compute_github_url_for_entry(entry_index, markdown_path)
     lancedb_result = insert_summary_into_lancedb(title, summary, github_url=github_url)
 
-    review_state["entries"][str(entry_index)] = {"node_ids": lancedb_result["node_ids"], "thread_ts": thread_ts}
+    review_state["entries"][str(entry_index)] = with_provenance(
+        existing_entry_state, lancedb_result["node_ids"], thread_ts
+    )
     save_review_state(review_state)
     # Insert-then-delete: a crash in the gap may leave a brief duplicate row, not a hole
     # with nothing retrievable until retry. Skip delete when the state file has no
@@ -630,7 +702,28 @@ def replace_verified_qa_pair(thread_ts: str, conversation_thread: str) -> Dict[s
     }
 
 
-def enrich_verified_entry(existing_title: str, new_thread_conversation: str) -> Dict[str, Any]:
+def _provenance_record(
+    source_channel_id: Optional[str], source_thread_ts: Optional[str], timestamp_key: str
+) -> Optional[Dict[str, Any]]:
+    """Build one {source_channel_id, source_thread_ts, <timestamp_key>} record,
+    or None when the caller supplied no source at all (the pre-provenance
+    callers, whose review-state entries must keep their original shape)."""
+    if source_channel_id is None and source_thread_ts is None:
+        return None
+    return {
+        "source_channel_id": source_channel_id,
+        "source_thread_ts": source_thread_ts,
+        timestamp_key: datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def enrich_verified_entry(
+    existing_title: str,
+    new_thread_conversation: str,
+    *,
+    source_channel_id: Optional[str] = None,
+    source_thread_ts: Optional[str] = None,
+) -> Dict[str, Any]:
     """Merge/append pipeline for a NEW escalation thread that was tagged (via
     /tag_techsupport_thread/) as related to an already-existing verified entry --
     i.e. Lil Lisa answered by citing that entry, the user escalated anyway, and the
@@ -648,6 +741,12 @@ def enrich_verified_entry(existing_title: str, new_thread_conversation: str) -> 
     Raises LookupError if the markdown file doesn't exist or has no entry with this
     exact title -- the caller (nightly_pipeline.py) falls back to a normal add in
     that case rather than failing the whole thread.
+
+    `source_channel_id` / `source_thread_ts` are optional provenance: when either
+    is given, an {"source_channel_id", "source_thread_ts", "enriched_at"} record
+    is appended to this entry's "enrichments" list in review_state. Callers that
+    pass neither (the original nightly_pipeline.py call) leave the entry's shape
+    exactly as before.
     """
     configure_dspy_lm()
     markdown_filepath = VERIFIED_TECHSUPPORT_QA_FOLDERPATH / TECHSUPPORT_QA_MARKDOWN_FILENAME
@@ -689,10 +788,12 @@ def enrich_verified_entry(existing_title: str, new_thread_conversation: str) -> 
     # Preserve the entry's original thread_ts (the thread that first created it),
     # NOT the new escalation thread_ts -- replace_verified_qa_pair() still needs it
     # if the original thread later gets its own new replies.
-    review_state["entries"][str(entry_index)] = {
-        "node_ids": lancedb_result["node_ids"],
-        "thread_ts": existing_entry_state.get("thread_ts"),
-    }
+    review_state["entries"][str(entry_index)] = with_provenance(
+        existing_entry_state,
+        lancedb_result["node_ids"],
+        existing_entry_state.get("thread_ts"),
+        enrichment=_provenance_record(source_channel_id, source_thread_ts, "enriched_at"),
+    )
     save_review_state(review_state)
     if old_node_ids:
         vector_store.delete_nodes(old_node_ids)
@@ -700,6 +801,95 @@ def enrich_verified_entry(existing_title: str, new_thread_conversation: str) -> 
     return {
         "title": existing_title,
         "summary": merged_summary,
+        "markdown_path": str(markdown_path),
+        **lancedb_result,
+    }
+
+
+def correct_verified_entry(
+    existing_title: str,
+    correction_thread: str,
+    *,
+    source_channel_id: str,
+    source_thread_ts: str,
+) -> Dict[str, Any]:
+    """SUPERSEDE pipeline for an expert correction raised in a product channel:
+    Lil Lisa answered a user by citing a verified techsupport entry, and an
+    expert replied in that same thread to say the answer is wrong.
+
+    Structurally the twin of enrich_verified_entry() -- same locate-by-title,
+    same title-kept-verbatim (so the GitHub anchor stays stable), same
+    replace-markdown / re-embed / delete-old-node-ids ordering -- but it runs
+    CorrectTechsupportSummary instead of MergeTechsupportSummaries.
+    MergeTechsupportSummaries is deliberately append-only ("preserve the
+    existing content"), which is right for escalation enrichment and wrong
+    here: the whole point of a correction is that the contradicted content
+    must NOT survive. See the routing rule in the module docstring.
+
+    `correction_thread` is the role-tagged thread text produced by
+    techsupport_classifier.format_thread_messages() -- the user's question, the
+    bot's (unverified) answer, and the expert's correction, each tagged so the
+    prompt can tell which speaker is authoritative.
+
+    Provenance ({"source_channel_id", "source_thread_ts", "superseded_at"}) is
+    appended to this entry's "corrections" list in review_state. The entry's
+    original "thread_ts" is preserved -- the correction happened in a different
+    (product) channel thread, and replace_verified_qa_pair() still needs the
+    original if that thread later gets new replies.
+
+    Raises LookupError if the markdown file doesn't exist or has no entry with
+    this exact title -- same contract as enrich_verified_entry(), so the caller
+    can fall back to add_verified_qa_pair() rather than failing the thread.
+    """
+    configure_dspy_lm()
+    markdown_filepath = VERIFIED_TECHSUPPORT_QA_FOLDERPATH / TECHSUPPORT_QA_MARKDOWN_FILENAME
+    if not markdown_filepath.exists():
+        raise LookupError(f"No verified techsupport markdown file found -- cannot correct {existing_title!r}")
+
+    entries = parse_summary_markdown(markdown_filepath.read_text(encoding="utf-8"))
+    entry_index = next((i for i, entry in enumerate(entries) if entry["title"] == existing_title), None)
+    if entry_index is None:
+        raise LookupError(f"No existing verified entry titled {existing_title!r} -- cannot correct")
+
+    existing_summary = entries[entry_index]["summary"]
+    corrected_summary = correct_summary(
+        existing_summary=existing_summary, correction_thread=correction_thread
+    ).corrected_summary.strip()
+    corrected_summary = redact_obvious_pii(corrected_summary)
+    corrected_summary = sanitize_techsupport_summary(corrected_summary)
+
+    review_state = load_review_state()
+    existing_entry_state = review_entry_state(review_state, entry_index)
+    old_node_ids = node_ids_from_review_entry(existing_entry_state)
+
+    configure_embedding_model()
+    env = load_pipeline_env()
+    lancedb_folderpath = str(_resolve_path(env["LANCEDB_FOLDERPATH"]))
+    db = lancedb.connect(lancedb_folderpath)
+    vector_store = LanceDBVectorStore(
+        connection=db, uri=lancedb_folderpath, table_name=TECHSUPPORT_QA_TABLE_NAME, query_type="hybrid"
+    )
+
+    # Title unchanged -- see docstring: this is what keeps the GitHub anchor stable.
+    markdown_path = replace_summary_in_markdown(entry_index, existing_title, corrected_summary)
+    github_url = _compute_github_url_for_entry(entry_index, markdown_path)
+    lancedb_result = insert_summary_into_lancedb(existing_title, corrected_summary, github_url=github_url)
+
+    review_state["entries"][str(entry_index)] = with_provenance(
+        existing_entry_state,
+        lancedb_result["node_ids"],
+        existing_entry_state.get("thread_ts"),
+        correction=_provenance_record(source_channel_id, source_thread_ts, "superseded_at"),
+    )
+    save_review_state(review_state)
+    # Insert-then-delete, same as enrich/replace: a crash in the gap leaves a
+    # brief duplicate row rather than nothing retrievable.
+    if old_node_ids:
+        vector_store.delete_nodes(old_node_ids)
+
+    return {
+        "title": existing_title,
+        "summary": corrected_summary,
         "markdown_path": str(markdown_path),
         **lancedb_result,
     }

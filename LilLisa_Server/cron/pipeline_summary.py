@@ -1,4 +1,9 @@
-"""Format nightly_pipeline ingest counts for logs and admin Slack alerts."""
+"""Format nightly_pipeline ingest counts for logs and admin Slack alerts.
+
+Serves both the techsupport loop's counts and the product-channel pass's
+(which adds "corrected" and "skipped_no_expert_reply", and carries no
+"enriched"); every key is optional, and anything unknown still shows up.
+"""
 
 from typing import Any, Iterable, List, Mapping, Optional
 
@@ -8,9 +13,12 @@ PIPELINE_COUNT_KEYS = (
     "checked",
     "added",
     "enriched",
+    "corrected",
     "replaced",
     "left_as_is_not_useful",
     "left_as_is_not_conclusive",
+    "skipped_no_expert_reply",
+    "skipped_no_expert_insight",
     "skipped_not_useful",
     "skipped_not_conclusive",
     "errored",

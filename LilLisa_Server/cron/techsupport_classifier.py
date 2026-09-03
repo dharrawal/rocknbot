@@ -52,6 +52,18 @@ PROJECT_ROOT = LILLISA_SERVER_ROOT
 
 SLACK_API_BASE = "https://slack.com/api"
 IGNORED_SUBTYPES = {"channel_join", "channel_leave"}
+# Placeholder the Slack bot posts while it works on an answer; it carries no
+# content, so it is dropped before the thread text reaches any prompt.
+PROCESSING_PLACEHOLDER = "Processing..."
+BOT_ROLE_TAG = "(bot)"
+# The escalate button posts the user's question into the techsupport channel
+# under the bot's identity (see lil-lisa/src/slack.py, techsupport_fallback_text:
+# "Question posted in <channel>. <question>"). That post is a relayed human
+# question, not an AI answer, so it gets its own tag rather than "(bot)".
+ESCALATION_RELAY_PREFIX = "Question posted in "
+ESCALATION_RELAY_ROLE_TAG = "(bot, relaying a user's question)"
+EXPERT_ROLE_TAG = "(expert)"
+DEFAULT_BOT_DISPLAY_NAME = "Lil Lisa"
 
 
 def load_llm_env() -> Dict[str, str]:
@@ -111,7 +123,9 @@ class IsUsefulConversation(dspy.Signature):
             "solutions, or reasoning around implementation decisions. "
             "Respond 'yes' even if only part of the conversation is useful. "
             "Respond 'no' only if the conversation contains no technical discussion or is entirely social, "
-            "off-topic, or noise."
+            "off-topic, or noise. "
+            "Speakers tagged '(bot)' are AI-generated and unverified, while a later message from a speaker "
+            "tagged '(expert)' is authoritative and supersedes the bot's content."
         )
     )
 
@@ -122,13 +136,33 @@ class IsConclusiveConversation(dspy.Signature):
         desc=(
             "Respond 'yes' if the conversation reaches any technical solution, answer, or resolved state. "
             "Respond 'no' if the conversation is left open-ended, unresolved, or inconclusive even if it is "
-            "technical."
+            "technical. "
+            "Speakers tagged '(bot)' are AI-generated and unverified, while a later message from a speaker "
+            "tagged '(expert)' is authoritative and supersedes the bot's content."
+        )
+    )
+
+
+class HasExpertInsight(dspy.Signature):
+    conversation_thread: str = dspy.InputField()
+    has_expert_insight: Literal["yes", "no"] = dspy.OutputField(
+        desc=(
+            "Respond 'yes' if any message from a speaker tagged '(expert)' corrects, confirms, or adds "
+            "technical insight to the answer given by the speaker tagged '(bot)' or to the topic of the "
+            "thread: a correction, a confirmation that the answer worked, an additional fix, a caveat, or "
+            "any other detail that makes the resolution more complete or more accurate. "
+            "Respond 'no' if the expert messages only ask questions, request clarification or more "
+            "information, or are social or off-topic. An expert asking a question is not insight, even "
+            "when the question is technical. "
+            "The first message in the thread is the thread parent and is never insight by itself, so an "
+            "expert who merely opened the thread does not count."
         )
     )
 
 
 check_useful = dspy.Predict(IsUsefulConversation)
 check_conclusive = dspy.Predict(IsConclusiveConversation)
+check_expert_insight = dspy.Predict(HasExpertInsight)
 
 
 # --- Slack JSON -> flat text formatting ---
@@ -164,15 +198,59 @@ def _resolve_user_name(user_id: str, slack_token: str) -> str:
     return name
 
 
-def format_thread_messages(messages: List[Dict[str, Any]], slack_token: Optional[str] = None) -> str:
+def _is_bot_message(msg: Dict[str, Any], bot_user_id: Optional[str]) -> bool:
+    """True if this Slack message was posted by a bot rather than a human.
+
+    Slack marks bot posts inconsistently depending on how they were sent, so
+    all three signals are accepted: a bot_id field, the configured bot's own
+    user id, or the bot_message subtype.
+    """
+    if msg.get("bot_id"):
+        return True
+    if bot_user_id and msg.get("user") == bot_user_id:
+        return True
+    return msg.get("subtype") == "bot_message"
+
+
+def _bot_display_name(msg: Dict[str, Any], default_name: str) -> str:
+    """Prefer the name Slack attached to the bot post, falling back to the
+    configured default (the bot's product-facing name)."""
+    bot_profile = msg.get("bot_profile")
+    profile_name = bot_profile.get("name") if isinstance(bot_profile, dict) else None
+    return msg.get("username") or profile_name or default_name
+
+
+def format_thread_messages(
+    messages: List[Dict[str, Any]],
+    slack_token: Optional[str] = None,
+    *,
+    bot_user_id: Optional[str] = None,
+    expert_user_ids: Optional[Any] = None,
+    bot_display_name: str = DEFAULT_BOT_DISPLAY_NAME,
+) -> str:
     """Turn a list of Slack message objects (as returned by
     conversations.replies, and consumed by nightly_techsupport_sync.py) into
-    a flat text block, one line per message: "[{ts}] {user}: {text}".
+    a flat text block, one line per message: "[{ts}] {speaker}: {text}".
+
+    Speakers carry a role tag so downstream prompts can tell an AI answer from
+    a human correction:
+      * bot turns render as "Lil Lisa (bot)" (see _is_bot_message for how a
+        bot turn is detected),
+      * a message whose user id is in `expert_user_ids` renders as
+        "{display_name} (expert)",
+      * everyone else keeps their plain display name.
+
+    Bot turns are kept: they are the context for what an expert corrected. The
+    bot's contentless "Processing..." placeholders are dropped.
+
+    `expert_user_ids` is supplied by the caller (the Slack user-group lookup
+    lives with the caller, not here) and may be any iterable of user ids.
 
     If slack_token is given, user IDs are resolved to display names via
     users.info (best-effort, cached). Otherwise raw user/bot IDs are used --
     resolving without a token is a follow-up, not required here.
     """
+    expert_ids = set(expert_user_ids or ())
     lines = []
     for msg in sorted(messages, key=lambda m: float(m["ts"])):
         if msg.get("subtype") in IGNORED_SUBTYPES:
@@ -180,12 +258,21 @@ def format_thread_messages(messages: List[Dict[str, Any]], slack_token: Optional
 
         ts = msg["ts"]
         text = msg.get("text", "")
+        if text.strip() == PROCESSING_PLACEHOLDER:
+            continue
+
         user_id = msg.get("user") or msg.get("bot_id") or "unknown"
 
-        if slack_token and msg.get("user"):
-            display_name = _resolve_user_name(user_id, slack_token)
+        if _is_bot_message(msg, bot_user_id):
+            role_tag = ESCALATION_RELAY_ROLE_TAG if text.startswith(ESCALATION_RELAY_PREFIX) else BOT_ROLE_TAG
+            display_name = f"{_bot_display_name(msg, bot_display_name)} {role_tag}"
         else:
-            display_name = user_id
+            if slack_token and msg.get("user"):
+                display_name = _resolve_user_name(user_id, slack_token)
+            else:
+                display_name = user_id
+            if msg.get("user") and msg["user"] in expert_ids:
+                display_name = f"{display_name} {EXPERT_ROLE_TAG}"
 
         lines.append(f"[{ts}] {display_name}: {text}")
 
@@ -209,10 +296,28 @@ def is_yes_answer(value: Any) -> bool:
     return text == "yes"
 
 
+def has_expert_insight(conversation_thread: str) -> bool:
+    """True if an expert message in this thread corrects, confirms, or adds
+    technical insight, rather than only asking questions or chatting.
+
+    `conversation_thread` is the role-tagged text format_thread_messages()
+    produces; the '(expert)' and '(bot)' tags are what the prompt reads. Used
+    by nightly_pipeline's product-channel pass as the gate after the cheap
+    has_expert_reply() check and before any routing, so an expert's own
+    question never rewrites a verified entry. Zero-shot and unoptimized, same
+    caveat as the classifiers above.
+    """
+    configure_dspy_lm()
+    result = check_expert_insight(conversation_thread=conversation_thread)
+    return is_yes_answer(result.has_expert_insight)
+
+
 def classify_thread(
     messages: List[Dict[str, Any]],
     slack_token: Optional[str] = None,
     skip_conclusive: bool = False,
+    bot_user_id: Optional[str] = None,
+    expert_user_ids: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Classify a single techsupport thread (Slack message JSON, e.g. the
     output of conversations.replies) as useful / conclusive.
@@ -229,9 +334,18 @@ def classify_thread(
     bar to enrich that entry, since it's adding supplementary insight to an
     already-resolved topic rather than needing to independently resolve
     something from scratch.
+
+    `bot_user_id` / `expert_user_ids` are forwarded to format_thread_messages
+    so bot and expert turns are role-tagged in the text the classifiers see.
+    Both are optional: omitting them reproduces the previous plain formatting.
     """
     configure_dspy_lm()
-    conversation_thread = format_thread_messages(messages, slack_token=slack_token)
+    conversation_thread = format_thread_messages(
+        messages,
+        slack_token=slack_token,
+        bot_user_id=bot_user_id,
+        expert_user_ids=expert_user_ids,
+    )
 
     useful_result = check_useful(conversation_thread=conversation_thread)
     is_useful = is_yes_answer(useful_result.is_useful)

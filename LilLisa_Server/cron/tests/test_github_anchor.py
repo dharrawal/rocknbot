@@ -9,14 +9,21 @@ Run from LilLisa_Server/cron:
     PYTHONPATH=. python3 tests/test_github_anchor.py
 """
 
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from github_anchor import GithubAnchorSlugger, github_slug  # noqa: E402
+import github_anchor  # noqa: E402
+from github_anchor import (  # noqa: E402
+    GithubAnchorSlugger,
+    github_slug,
+    load_github_repo_url,
+)
 
 
 class GithubSlugTests(unittest.TestCase):
@@ -53,6 +60,36 @@ class GithubAnchorSluggerDuplicateTests(unittest.TestCase):
         self.assertEqual(slugger.slug("Good First Issues"), "good-first-issues")
         self.assertEqual(slugger.slug("Code of Conduct"), "code-of-conduct-1")
         self.assertEqual(slugger.slug("Good First Issues"), "good-first-issues-1")
+
+
+class LoadGithubRepoUrlTests(unittest.TestCase):
+    """The prod image copies no env/ (build/dockerfile_prod), so the repo URL
+    can arrive as an env var over an empty placeholder file -- the same case
+    github_sync.load_env() supports."""
+
+    FILE_URL = "https://github.com/file-org/file-repo"
+    ENV_URL = "https://github.com/env-org/env-repo"
+
+    def test_env_var_used_when_file_is_missing_the_key(self):
+        with patch.object(github_anchor, "dotenv_values", return_value={}):
+            with patch.dict(os.environ, {"GITHUB_REPO_URL": self.ENV_URL}):
+                self.assertEqual(load_github_repo_url(), self.ENV_URL)
+
+    def test_env_var_wins_over_file_placeholder(self):
+        with patch.object(github_anchor, "dotenv_values", return_value={"GITHUB_REPO_URL": ""}):
+            with patch.dict(os.environ, {"GITHUB_REPO_URL": self.ENV_URL}):
+                self.assertEqual(load_github_repo_url(), self.ENV_URL)
+
+    def test_file_used_when_env_var_absent(self):
+        with patch.object(github_anchor, "dotenv_values", return_value={"GITHUB_REPO_URL": self.FILE_URL}):
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(load_github_repo_url(), self.FILE_URL)
+
+    def test_raises_when_configured_nowhere(self):
+        with patch.object(github_anchor, "dotenv_values", return_value={}):
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(RuntimeError):
+                    load_github_repo_url()
 
 
 if __name__ == "__main__":

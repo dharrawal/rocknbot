@@ -54,6 +54,39 @@ class FormatPipelineCountsTests(unittest.TestCase):
         self.assertTrue(rendered.startswith("added=1"))
         self.assertIn("enriched=4", rendered)
 
+    def test_product_channel_counts_render_in_order(self):
+        # The product-channel pass has no "enriched" and adds "corrected" plus
+        # the two expert gates -- every key is optional, none may vanish.
+        counts = {
+            "checked": 5,
+            "corrected": 2,
+            "added": 1,
+            "replaced": 0,
+            "left_as_is_not_useful": 0,
+            "left_as_is_not_conclusive": 0,
+            "skipped_no_expert_reply": 2,
+            "skipped_no_expert_insight": 3,
+            "skipped_not_useful": 0,
+            "skipped_not_conclusive": 0,
+            "errored": 0,
+        }
+        rendered = format_pipeline_counts(counts)
+        self.assertNotIn("enriched", rendered)
+        self.assertIn("corrected=2", rendered)
+        self.assertIn("skipped_no_expert_reply=2", rendered)
+        self.assertIn("skipped_no_expert_insight=3", rendered)
+        self.assertLess(rendered.index("added=1"), rendered.index("corrected=2"))
+        self.assertLess(rendered.index("corrected=2"), rendered.index("replaced=0"))
+        self.assertLess(
+            rendered.index("skipped_no_expert_reply=2"), rendered.index("skipped_no_expert_insight=3")
+        )
+        self.assertLess(rendered.index("skipped_no_expert_insight=3"), rendered.index("skipped_not_useful=0"))
+
+    def test_extra_product_metadata_still_shows_up(self):
+        rendered = format_pipeline_counts({"checked": 0, "channel_id": "C_IDA", "skipped_reason": "no_experts"})
+        self.assertIn("channel_id=C_IDA", rendered)
+        self.assertIn("skipped_reason=no_experts", rendered)
+
     def test_unknown_keys_are_appended_sorted(self):
         counts = self._sample_counts()
         counts["zeta_new"] = 9

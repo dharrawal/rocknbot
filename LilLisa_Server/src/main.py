@@ -67,12 +67,13 @@ from src.agent_and_tools import (
     create_docdbs_lancedb_retrievers_and_indices,
     create_qa_pairs_lancedb_retrievers_and_indices,
 )
+from src import golden_qa_sync
 from src.embedding_config import VoyageEmbedding, VOYAGE_EMBEDDING_DIMENSION
 from src.lillisa_server_context import LOCALE, LilLisaServerContext
 from src.llama_index_lancedb_vector_store import LanceDBVectorStore
 from src.llama_index_markdown_reader import MarkdownReader
 
-from src.techsupport_thread_tags import THREAD_TAGS_LOCK, upsert_thread_tag
+from src.techsupport_thread_tags import THREAD_TAGS_LOCK, upsert_answer_tag, upsert_thread_tag
 from src import techsupport_cron
 from src import observability
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
@@ -966,6 +967,16 @@ def invoke(
             answer_found = True
             primary_techsupport_match_title = None
 
+        if primary_techsupport_match_title:
+            # Nightly product-channel pass reads this (get_cited_entry_title) to tell an
+            # expert correction of a cited entry from a brand-new Q&A. Best-effort only.
+            try:
+                upsert_answer_tag(session_id, primary_techsupport_match_title)
+            except Exception as tag_exc:  # pylint:disable=broad-except
+                utils.logger.warning(
+                    "Failed to record techsupport answer tag for session %s: %s", session_id, tag_exc
+                )
+
         needs_escalation = not answer_found
 
         utils.logger.debug(
@@ -1078,7 +1089,22 @@ async def add_expert_qa_pair(
         
         # Add to LanceDB QA pairs table (this appends to existing table, doesn't replace it)
         await _add_qa_pair_to_lancedb(question, answer, product)
-        
+
+        # ...and push the same pair to the golden QA pairs repo, so it survives
+        # _run_update_golden_qa_pairs_task(), which drops the LanceDB table and
+        # rebuilds it purely from that repo. Blocking git work, so off the event
+        # loop; never raises, so a failed push cannot undo the LanceDB insert.
+        push_result = await asyncio.to_thread(
+            golden_qa_sync.append_expert_qa_pair_to_repo, product, question, answer
+        )
+        pushed = bool(push_result.get("pushed"))
+        if not pushed:
+            utils.logger.error(
+                "Expert QA pair stored in LanceDB but NOT pushed to the golden QA repo "
+                "(it will be lost on the next golden QA rebuild): %s",
+                push_result.get("error"),
+            )
+
         # Log the expert verification
         timestamp = datetime.now(timezone.utc).isoformat()
         log_entry = {
@@ -1092,12 +1118,17 @@ async def add_expert_qa_pair(
             "answer": answer
         }
         utils.logger.info(f"Expert QA Verification: {json.dumps(log_entry)}")
-        
+
         return JSONResponse(content={
             "success": True,
-            "message": "QA pair added successfully",
+            "message": (
+                "QA pair added successfully"
+                if pushed
+                else "QA pair added to the index, but could not be pushed to the golden QA repo"
+            ),
             "question": question,
-            "answer": answer
+            "answer": answer,
+            "pushed": pushed
         })
         
     except jwt.exceptions.InvalidSignatureError as e:
@@ -1259,6 +1290,52 @@ async def run_nightly_pipeline(encrypted_key: str, background_tasks: BackgroundT
 
     background_tasks.add_task(techsupport_cron.run_once)
     return "Nightly techsupport pipeline initiated. Progress and the run summary are in the server logs."
+
+
+@app.post("/run_product_channel_scan/", response_model=str, response_class=PlainTextResponse)
+async def run_product_channel_scan(encrypted_key: str, background_tasks: BackgroundTasks, force: bool = True) -> str:
+    """
+    Runs only the product-channel expert-correction pass, in this process, in the background.
+
+    The narrow sibling of /run_nightly_pipeline/: it scans the IDA/IDDM/IDO
+    channels for expert replies and publishes what changed (GitHub push plus
+    index reload), but skips the tech support loop, the review sync and the
+    contextual re-embed.
+
+    `force` defaults to True because a manual trigger is an operator saying
+    "scan now": with the default, the per-channel TECHSUPPORT_SYNC_INTERVAL_HOURS
+    gate is bypassed and every configured channel is scanned. Pass force=false
+    to respect that gate, i.e. to behave exactly like the nightly run.
+
+    Shares one lock with the nightly pipeline, so a scan landing during a
+    nightly run (or vice versa) is dropped rather than queued -- see
+    techsupport_cron.run_product_channel_scan_once.
+
+    Args:
+        encrypted_key (str): JWT key for authentication.
+        background_tasks (BackgroundTasks): FastAPI background task manager.
+        force (bool): Bypass the per-channel interval gate. Defaults to True.
+
+    Returns:
+        str: Immediate confirmation message (the scan itself takes minutes).
+    """
+    try:
+        _require_jwt(encrypted_key)
+    except jwt.exceptions.InvalidSignatureError as e:
+        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
+
+    if not techsupport_cron.is_available():
+        utils.logger.error(
+            "run_product_channel_scan() requested but the cron package is unavailable: %s",
+            techsupport_cron.IMPORT_ERROR,
+        )
+        raise HTTPException(status_code=503, detail="Nightly techsupport pipeline is not installed in this image.")
+
+    if techsupport_cron.is_running():
+        return "Techsupport pipeline is already running. This request was ignored."
+
+    background_tasks.add_task(techsupport_cron.run_product_channel_scan_once, force)
+    return "Product-channel expert-correction scan initiated. Progress and the run summary are in the server logs."
 
 
 # Written here by this API process. The cron/ jobs read the same path

@@ -15,6 +15,8 @@ scripts/env/*
 # Escalation tags written by POST /tag_techsupport_thread/ (API process).
 # Cron jobs live in cron/ and read this same path.
 scripts/techsupport_thread_tags.json
+# Cited-entry tags written by invoke() at answer time (same reader).
+scripts/techsupport_answer_tags.json
 
 # Ignore Docker ignore files
 # Exception: the image build now depends on .dockerignore to keep .venv and

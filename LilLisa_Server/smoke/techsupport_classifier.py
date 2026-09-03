@@ -30,15 +30,22 @@ SMOKE_DIR = Path(__file__).resolve().parent
 SCRIPTS_DIR = SMOKE_DIR.parent / "cron"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from nightly_techsupport_sync import load_env, load_state, paginate_messages  # noqa: E402
+from nightly_techsupport_sync import (  # noqa: E402
+    channel_state,
+    default_channel_id,
+    load_env,
+    load_state,
+    paginate_messages,
+)
 from techsupport_classifier import classify_thread  # noqa: E402
 
 DEFAULT_THREAD_COUNT = 4
 
 
 def pick_default_thread_ids(limit: int = DEFAULT_THREAD_COUNT) -> List[str]:
-    state = load_state()
-    threads = state.get("threads", {})
+    # State is keyed by channel since the product-channel pass landed; this
+    # smoke script only ever looks at the techsupport channel's slice.
+    threads = channel_state(load_state(), default_channel_id() or "")["threads"]
     with_replies = [ts for ts, info in threads.items() if info.get("last_seen_reply_ts") != ts]
     candidates = with_replies if len(with_replies) >= limit else list(threads.keys())
     return candidates[:limit]

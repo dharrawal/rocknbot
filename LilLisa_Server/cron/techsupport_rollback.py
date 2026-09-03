@@ -46,6 +46,7 @@ Usage (standalone):
     python techsupport_rollback.py rollback <version_number>
 """
 
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -73,9 +74,11 @@ def _resolve_path(raw: str) -> Path:
 
 
 def _open_table():
-    env = dict(dotenv_values(str(LILLISA_SERVER_ENV_PATH)))
+    # os.environ overlay so rollback still works on a deployment that injects
+    # config as env vars instead of mounting env/ (see build/dockerfile_prod).
+    env = {**dict(dotenv_values(str(LILLISA_SERVER_ENV_PATH))), **os.environ}
     if not env.get("LANCEDB_FOLDERPATH"):
-        raise RuntimeError(f"LANCEDB_FOLDERPATH not found in {LILLISA_SERVER_ENV_PATH}")
+        raise RuntimeError(f"LANCEDB_FOLDERPATH not found in {LILLISA_SERVER_ENV_PATH} or the process environment")
     lancedb_folderpath = str(_resolve_path(env["LANCEDB_FOLDERPATH"]))
     db = lancedb.connect(lancedb_folderpath)
     if TECHSUPPORT_QA_TABLE_NAME not in db.table_names():

@@ -147,6 +147,10 @@ def push_verified_qa_pairs() -> Dict[str, Any]:
             env=git_env,
             # Do not let a global credential.helper persist the PAT to disk.
             multi_options=["--config", "credential.helper="],
+            # GitPython >= 3.1.31 lists --config as an "unsafe" clone option and
+            # raises UnsafeOptionError without this flag (confirmed against the
+            # pinned 3.1.43). The value above is a fixed literal, not user input.
+            allow_unsafe_options=True,
         )
 
         dest_path = Path(clone_dir) / TECHSUPPORT_QA_MARKDOWN_FILENAME
