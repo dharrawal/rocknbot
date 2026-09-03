@@ -27,10 +27,34 @@ This is step one of the nightly techsupport sync job: it only detects new /
 updated threads. Classifying threads as resolved (or anything else) is a
 separate, later step.
 
+sync() is channel-parametric: sync() with no argument syncs
+TECHSUPPORT_CHANNEL_ID (the historical behaviour nightly_pipeline.py's
+techsupport loop relies on), sync(channel_id=...) syncs any other channel --
+used by nightly_pipeline.py's product-channel pass (PRODUCT_CHANNEL_ID_IDA /
+_IDDM / _IDO), which looks for expert corrections in the IDA/IDDM/IDO
+channels. State is therefore keyed by channel:
+
+    {"version": 2,
+     "channels": {"<channel id>": {"last_run_timestamp": ...,
+                                   "last_catchup_timestamp": ...,
+                                   "threads": {...}}}}
+
+load_state() accepts only this shape. A missing file starts a fresh v2
+state; an existing file whose top-level "version" is not 2 (including the
+pre-version-2 flat shape, which had last_run_timestamp /
+last_catchup_timestamp / threads at the top level) raises RuntimeError
+naming the path, so the run stops instead of silently starting over. The
+operator deletes the file and re-runs; nothing shipped has the old shape.
+
 Required env vars (see ./env/techsupport_sync.env):
     SLACK_BOT_TOKEN        - Slack bot token with channels:history / groups:history
                               (and the read scope for the channel type in use)
     TECHSUPPORT_CHANNEL_ID - Channel ID to sync (e.g. the test-techsupport channel)
+
+Optional (see ./env/techsupport_sync.env):
+    PRODUCT_CHANNEL_ID_IDA / _IDDM / _IDO - product channels scanned for expert
+                              corrections; a missing one disables that product.
+    LIL_LISA_SLACK_USERID   - the bot's Slack user id, used to role-tag its turns.
 
 Optional knobs (env/lillisa_server.env, overridable in the process environment):
     TECHSUPPORT_SYNC_HOT_DAYS                - nightly parent-lookup window (default 30)
@@ -46,7 +70,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import requests
 from dotenv import dotenv_values
@@ -65,6 +89,12 @@ from atomic_io import atomic_write_json  # noqa: E402
 
 ENV_PATH = SCRIPT_DIR / "env" / "techsupport_sync.env"
 STATE_PATH = SCRIPT_DIR / "techsupport_sync_state.json"
+
+# Bump only for a shape change; load_state() rejects any other version.
+STATE_VERSION = 2
+
+PRODUCTS: Tuple[str, ...] = ("IDA", "IDDM", "IDO")
+PRODUCT_CHANNEL_ENV_KEY = "PRODUCT_CHANNEL_ID_{product}"
 
 SLACK_API_BASE = "https://slack.com/api"
 IGNORED_SUBTYPES = {"channel_join", "channel_leave"}
@@ -155,11 +185,66 @@ def get_max_parent_lookups() -> int:
     return int(float(_pipeline_env().get("TECHSUPPORT_SYNC_MAX_PARENT_LOOKUPS", str(DEFAULT_MAX_PARENT_LOOKUPS))))
 
 
+def product_channel_ids(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+    """{"IDA": "C123", ...} for whichever PRODUCT_CHANNEL_ID_* are configured.
+
+    All three are optional; a product with no channel id is simply not scanned.
+    """
+    env = env if env is not None else _sync_env()
+    configured: Dict[str, str] = {}
+    for product in PRODUCTS:
+        channel_id = (env.get(PRODUCT_CHANNEL_ENV_KEY.format(product=product)) or "").strip()
+        if channel_id:
+            configured[product] = channel_id
+    return configured
+
+
+def _sync_env() -> Dict[str, str]:
+    """techsupport_sync.env overlaid by the process environment, with none of
+    load_env()'s required-var enforcement (callers here only want optionals)."""
+    env = {k: v for k, v in dotenv_values(str(ENV_PATH)).items() if v is not None}
+    env.update(os.environ)
+    return env
+
+
+def default_channel_id() -> Optional[str]:
+    """TECHSUPPORT_CHANNEL_ID, or None if it isn't configured."""
+    return (_sync_env().get("TECHSUPPORT_CHANNEL_ID") or "").strip() or None
+
+
+def new_state() -> Dict[str, Any]:
+    return {"version": STATE_VERSION, "channels": {}}
+
+
+def channel_state(state: Dict[str, Any], channel_id: str) -> Dict[str, Any]:
+    """The per-channel sub-state (created empty if this channel is new)."""
+    channels = state.setdefault("channels", {})
+    per_channel = channels.setdefault(channel_id, {})
+    per_channel.setdefault("last_run_timestamp", "0")
+    per_channel.setdefault("threads", {})
+    return per_channel
+
+
 def load_state() -> Dict[str, Any]:
+    """Read the channel-keyed state file, or start a fresh one if it is absent.
+
+    Any existing file that is not version 2 is rejected rather than repaired:
+    this file was introduced on this branch, so a foreign shape means the file
+    is stale or hand-edited, and silently starting over would quietly lose
+    every added_to_verified_db flag.
+    """
     if not STATE_PATH.exists():
-        return {"last_run_timestamp": "0", "threads": {}}
+        return new_state()
     with open(STATE_PATH, encoding="utf-8") as f:
-        return json.load(f)
+        state = json.load(f)
+    if not isinstance(state, dict) or state.get("version") != STATE_VERSION:
+        raise RuntimeError(
+            f"{STATE_PATH} predates the channel-keyed state format "
+            f"(expected top-level \"version\": {STATE_VERSION}). Delete the file and re-run; "
+            "the next run rebuilds it, and for the tech support channel that means the first "
+            "sync starts from the beginning of the channel again."
+        )
+    return state
 
 
 def save_state(state: Dict[str, Any]) -> None:
@@ -277,8 +362,9 @@ def select_parent_lookups(
     return chosen, skipped_over_cap
 
 
-def is_catchup_due(state: Dict[str, Any], now: float, interval_days: float) -> bool:
-    last = state.get("last_catchup_timestamp")
+def is_catchup_due(channel_sub_state: Dict[str, Any], now: float, interval_days: float) -> bool:
+    """`channel_sub_state` is one channel's slice of the state (channel_state())."""
+    last = channel_sub_state.get("last_catchup_timestamp")
     if last is None or last == "":
         return True
     return (now - float(last)) >= interval_days * SECONDS_PER_DAY
@@ -331,19 +417,25 @@ def _refresh_known_threads(
     return updated_thread_ids
 
 
-def sync() -> Dict[str, List[str]]:
-    """Detect new/updated threads in the techsupport channel and update the
-    on-disk state file accordingly. Returns
+def sync(channel_id: Optional[str] = None) -> Dict[str, List[str]]:
+    """Detect new/updated threads in one Slack channel and update that
+    channel's slice of the on-disk state file accordingly. Returns
     {"new_thread_ids": [...], "updated_thread_ids": [...]} so callers (e.g.
     nightly_pipeline.py) can process exactly the threads that changed since
-    the last run, without re-implementing the state-tracking logic here."""
+    the last run, without re-implementing the state-tracking logic here.
+
+    `channel_id` defaults to TECHSUPPORT_CHANNEL_ID, which is exactly the
+    behaviour every pre-existing caller had. Pass a product channel id to run
+    the same detection there; the hot/catch-up windows and the parent-lookup
+    cap are per channel, using the same env knobs."""
     env = load_env()
     token = env["SLACK_BOT_TOKEN"]
-    channel_id = env["TECHSUPPORT_CHANNEL_ID"]
+    channel_id = channel_id or env["TECHSUPPORT_CHANNEL_ID"]
 
     state = load_state()
-    threads = state.setdefault("threads", {})
-    last_run_timestamp = state.get("last_run_timestamp", "0")
+    per_channel = channel_state(state, channel_id)
+    threads = per_channel["threads"]
+    last_run_timestamp = per_channel.get("last_run_timestamp", "0")
     now = time.time()
 
     # Snapshot of threads we already knew about *before* this run, so we can
@@ -365,7 +457,7 @@ def sync() -> Dict[str, List[str]]:
 
     hot_ids, hot_capped = select_parent_lookups(previously_known_thread_ids, threads, now, hot_days, max_lookups)
     lookup_ids = list(hot_ids)
-    catchup_due = is_catchup_due(state, now, catchup_interval_days)
+    catchup_due = is_catchup_due(per_channel, now, catchup_interval_days)
     catchup_ids: List[str] = []
     catchup_capped = 0
     if catchup_due:
@@ -380,8 +472,9 @@ def sync() -> Dict[str, List[str]]:
         lookup_ids.extend(catchup_ids)
 
     logger.info(
-        "Parent lookups: hot=%d (window=%.0fd, capped=%d) catchup_due=%s catchup=%d "
+        "Parent lookups for channel %s: hot=%d (window=%.0fd, capped=%d) catchup_due=%s catchup=%d "
         "(age_cap=%.0fd, capped=%d) skipped_older_than_catchup=%d",
+        channel_id,
         len(hot_ids),
         hot_days,
         hot_capped,
@@ -394,9 +487,9 @@ def sync() -> Dict[str, List[str]]:
 
     updated_thread_ids = _refresh_known_threads(token, channel_id, threads, lookup_ids)
 
-    state["last_run_timestamp"] = f"{now:.6f}"
+    per_channel["last_run_timestamp"] = f"{now:.6f}"
     if catchup_due:
-        state["last_catchup_timestamp"] = f"{now:.6f}"
+        per_channel["last_catchup_timestamp"] = f"{now:.6f}"
     save_state(state)
 
     new_thread_ids = [msg["ts"] for msg in new_threads]

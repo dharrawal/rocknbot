@@ -65,6 +65,32 @@ Initiates a complete rebuild using contextual Voyage chunking with voyage-contex
 
 Deletes session folders under SPEEDICT_FOLDERPATH that are older than the configured retention period. This endpoint requires the environment variable `SESSION_LIFETIME_DAYS` (e.g., `SESSION_LIFETIME_DAYS = 30`) to determine which sessions to remove based on their age. This helps manage disk space by removing outdated conversation histories.
 
+**/add_expert_qa_pair/**
+
+Adds an expert-verified question and answer pair to the golden QA database. Called by the Slack bot when an expert reacts with a thumbs up to one of Lil Lisa's answers. The pair is inserted into the product's LanceDB QA pairs table and is also appended and pushed to the golden QA pairs repository, so it survives the next `/update_golden_qa_pairs/` rebuild (which drops the table and rebuilds it from that repo). The JSON response carries a `pushed` field: `false` means the pair answers queries now but did not reach the repo, so it would be lost at the next rebuild.
+
+**/tag_techsupport_thread/**
+
+Records that a newly created tech support escalation thread relates to an existing verified tech support entry, so the nightly pipeline merges the new insight into that entry instead of adding a near duplicate. Stored in `scripts/techsupport_thread_tags.json`, which the pipeline only reads.
+
+**/reload_techsupport_qa_pairs/**
+
+Rebuilds the in-memory QA pairs retrievers and indices (including `TECHSUPPORT_QA_PAIRS`) from the current on-disk LanceDB tables. The nightly pipeline writes new verified entries straight to LanceDB, so without this call a long-running server keeps serving from the retrievers it built at startup.
+
+**/run_nightly_pipeline/**
+
+Runs the nightly tech support pipeline immediately, as a background task, for ops work and post-deploy verification. It returns right away and the run summary goes to the server log. Overlapping runs are dropped rather than queued, and it returns 503 if the image was built without the `cron` package.
+
+**/run_product_channel_scan/**
+
+Runs only the product-channel expert-correction pass immediately, as a background task: the IDA/IDDM/IDO channels are scanned for expert replies, and whatever changed is pushed to the verified entries repo and reloaded into the running index. The tech support loop, the review sync and the contextual re-embed are not run. The optional `force` parameter defaults to true, which bypasses the per-channel check interval so every configured channel is scanned now; pass `force=false` to respect it. Shares one lock with the nightly pipeline, so overlapping runs are dropped rather than queued.
+
+## Nightly techsupport pipeline
+
+`cron/nightly_pipeline.py` ships inside the server image and the API process runs it on a timer, so there is no crontab and no second container. Each run first scans the tech support channel for threads that reached a resolution and turns them into verified entries in `techsupport_qa_pairs.md` plus LanceDB. It then scans the IDA/IDDM/IDO product channels for threads where a member of that product's expert user group replied to one of Lil Lisa's answers. A thread with no expert reply never reaches an LLM call. If the answer in the thread cited an existing verified entry, the expert's reply rewrites that entry, keeping its title so its GitHub link stays valid; otherwise the thread is added as a new entry.
+
+State lives next to the scripts in `cron/`: `techsupport_sync_state.json` (per channel), `techsupport_review_state.json`, and `techsupport_reembed_state.json`. The API writes two tag files that the pipeline reads, `scripts/techsupport_thread_tags.json` and `scripts/techsupport_answer_tags.json`. All of those paths need persistent storage. Full ops detail, including the environment variables involved, is in "PR42 Release and Deployment Notes.md" at the root of this repo.
+
 ## Contributing
 
 The project is not currently open for contributions.

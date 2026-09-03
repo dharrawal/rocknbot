@@ -30,6 +30,10 @@ For use in a channel, simply call **@rocknbot** in the channel, and it will retu
 For IDDM queries, refer to the "lil-elvis" channel.
 For IDA queries, refer to the "lil-lisa" channel.
 
+Experts are everyone in the product's Slack user group (`EXPERT_GROUP_ID_*`), so expert handling applies to every member rather than to one configured person: a thumbs up on one of Lil Lisa's answers turns that question and answer into a golden QA pair, which is now also pushed to the QA pairs repo so it survives the next rebuild, and the confirmation DM goes to whoever reacted.
+
+An expert who wants to correct an answer just replies in that thread, with no command or prefix. LilLisa Server's nightly pipeline scans the product channels for those replies and either rewrites the knowledge base entry the answer came from or files the thread as a new one.
+
 The slash commands available for admin use include:
 
 **/get_golden_qa_pairs**
@@ -80,6 +84,9 @@ The project is not currently open for contributions.
 The application uses several environment variables configured in `app_envfiles/lil-lisa.env`:
 
 - **MAX_LENGTH**: Controls the maximum length of messages sent to Slack (e.g., `MAX_LENGTH = 4000`). Messages exceeding this limit will be truncated to ensure proper formatting and delivery.
+- **EXPERT_GROUP_ID_IDA / _IDDM**: Required. Slack **user group** IDs (e.g. `S0123ABCD`, from `usergroups.list`, not the `@handle`) whose members count as experts for that product. This is the only source of expert identity, so the bot refuses to start if either is missing. The Slack app needs the `usergroups:read` scope; without it expert lookups fail loudly rather than treating everyone as a non-expert.
+- **EXPERT_GROUP_ID_IDO**: Optional, for the IDO product. With no group, nobody is an IDO expert.
+- **EXPERT_GROUP_CACHE_SECONDS**: How long expert group membership is cached before Slack is asked again, in seconds (default `300`). A failed refresh keeps serving the last cached membership; with nothing cached it raises.
 - Other Slack API tokens and channel configurations as required
 
 ### Deployment Instructions

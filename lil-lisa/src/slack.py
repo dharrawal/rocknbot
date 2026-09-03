@@ -28,6 +28,12 @@ from escalation_tracker import (
     hydrate_endorsement_tracker,
     is_escalation_active,
 )
+from expert_group import (
+    ExpertResolver,
+    RateLimited,
+    cache_seconds_from_env,
+    group_ids_from_env,
+)
 from utils import (
     assert_shared_techsupport_channel_ids,
     build_escalation_button_value,
@@ -54,7 +60,6 @@ ADMIN_CHANNEL_ID_IDA = lil_lisa_env["ADMIN_CHANNEL_ID_IDA"]
 # IDO Slack channels are optional — set to None if not configured
 CHANNEL_ID_IDO = lil_lisa_env.get("CHANNEL_ID_IDO")
 ADMIN_CHANNEL_ID_IDO = lil_lisa_env.get("ADMIN_CHANNEL_ID_IDO")
-EXPERT_USER_ID_IDO = lil_lisa_env.get("EXPERT_USER_ID_IDO")
 if not CHANNEL_ID_IDO:
     logger.warning("CHANNEL_ID_IDO not found in lil-lisa.env — IDO Slack channel support will be disabled")
 
@@ -80,8 +85,12 @@ assert_shared_techsupport_channel_ids(
         "IDO": TECHSUPPORT_CHANNEL_ID_IDO,
     }
 )
-EXPERT_USER_ID_IDA = lil_lisa_env["EXPERT_USER_ID_IDA"]
-EXPERT_USER_ID_IDDM = lil_lisa_env["EXPERT_USER_ID_IDDM"]
+# Expert identity is a Slack user group per product. EXPERT_GROUP_ID_IDA and
+# _IDDM are required: the resolver below refuses to build without them, so the
+# bot fails to boot on a misconfiguration instead of silently having no experts.
+EXPERT_GROUP_ID_IDA = lil_lisa_env.get("EXPERT_GROUP_ID_IDA")
+EXPERT_GROUP_ID_IDDM = lil_lisa_env.get("EXPERT_GROUP_ID_IDDM")
+EXPERT_GROUP_ID_IDO = lil_lisa_env.get("EXPERT_GROUP_ID_IDO")
 AUTHENTICATION_KEY = lil_lisa_env["AUTHENTICATION_KEY"]
 ENCRYPTED_AUTHENTICATION_KEY = jwt.encode({"some": "payload"}, AUTHENTICATION_KEY, algorithm="HS256")  # type: ignore
 MAX_LENGTH = int(lil_lisa_env["MAX_LENGTH"])
@@ -95,6 +104,39 @@ logger.info(f"LIL_LISA_SERVER_URL: {BASE_URL}")
 
 TIMEOUT = 10
 app = AsyncApp(token=SLACK_BOT_TOKEN)
+
+
+async def _fetch_usergroup_members(usergroup_id):
+    """Slack `usergroups.users.list` for the expert resolver (needs `usergroups:read`).
+
+    Raises expert_group.RateLimited on `ratelimited` so the resolver owns the
+    retry policy; every other error propagates and the resolver either serves
+    its last cached membership or raises ExpertLookupError.
+    """
+    try:
+        resp = await app.client.usergroups_users_list(usergroup=usergroup_id)
+    except SlackApiError as exc:
+        response = getattr(exc, "response", None)
+        error = (response.get("error") if response is not None else None) or ""
+        if error == "ratelimited":
+            headers = getattr(response, "headers", {}) or {}
+            raise RateLimited(float(headers.get("Retry-After", 1))) from exc
+        raise
+    return list(resp.get("users") or [])
+
+
+# Expert identity: one Slack user group per product. Membership is cached
+# (EXPERT_GROUP_CACHE_SECONDS, default 300s) so the per-message and per-reaction
+# hot paths do not call Slack. See src/expert_group.py.
+# A missing EXPERT_GROUP_ID_IDA / _IDDM raises here, at import, exactly like a
+# missing SLACK_BOT_TOKEN: there is no fallback expert any more.
+expert_resolver = ExpertResolver(
+    group_ids=group_ids_from_env(lil_lisa_env),
+    fetch_members=_fetch_usergroup_members,
+    cache_seconds=cache_seconds_from_env(lil_lisa_env),
+)
+if not expert_resolver.is_configured("IDO"):
+    logger.warning("No EXPERT_GROUP_ID_IDO configured — IDO expert support disabled")
 
 
 async def _requests_call(func, *args, **kwargs):
@@ -241,21 +283,21 @@ def get_last_bot_message(messages, current_ts, skip_text="Processing..."):
         return max(bot_messages, key=lambda x: float(x.get("ts", "0")))
     return None
 
-def is_expert_upvote(user_id, emoji, message_text, expert_user_id):
+def is_expert_upvote(reactor_is_expert, emoji, message_text):
     """
     Helper function to check if this is an expert upvote on a non-chunk message.
-    
+
     Args:
-        user_id: User who gave the reaction/emoji
+        reactor_is_expert: Whether the reacting user is an expert for this
+            channel's product (resolved via expert_resolver.is_expert()).
         emoji: The emoji (👍 or 👎)
         message_text: Text of the message being endorsed
-        expert_user_id: The expert user ID for this channel
-    
+
     Returns:
         Boolean indicating if this is an expert upvote on a full answer
     """
-    return (user_id == expert_user_id and 
-            emoji == "👍" and 
+    return (bool(reactor_is_expert) and
+            emoji == "👍" and
             not message_text.startswith("*Chunk "))
 
 def parse_chunk_message(text):
@@ -525,7 +567,8 @@ async def add_expert_verified_qa_pair(item_ts, channel_id, expert_user_id):
     Args:
         item_ts: The timestamp of the message that received thumbs up
         channel_id: The channel where the endorsement happened
-        expert_user_id: The expert user ID to DM
+        expert_user_id: The expert who gave the thumbs up — recorded with the QA
+            pair and DMed the confirmation (not a configured single expert ID)
     """
     try:
         # Get the actual message that was thumbs-upped
@@ -571,7 +614,7 @@ async def add_expert_verified_qa_pair(item_ts, channel_id, expert_user_id):
             return
         
         # Determine product based on channel
-        product, _ = determine_product_and_expert(channel_id)
+        product = determine_product(channel_id)
         
         if not product:
             logger.warning(f"Could not determine product for channel {channel_id}")
@@ -602,7 +645,20 @@ async def add_expert_verified_qa_pair(item_ts, channel_id, expert_user_id):
                 # DM the expert with the new QA pair
                 direct_message_convo = await app.client.conversations_open(users=expert_user_id)
                 dm_channel_id = direct_message_convo.data["channel"]["id"]
-                
+
+                # The server also pushes the pair to the golden QA pairs GitHub repo so it
+                # survives the next rebuild of the index. Say so, or warn if that push failed.
+                if result.get("pushed"):
+                    persistence_note = (
+                        "This QA pair has been automatically added to the golden QA database and pushed to the "
+                        "QA pairs repo, so it will survive the next golden QA rebuild."
+                    )
+                else:
+                    persistence_note = (
+                        "⚠️ This QA pair was added to the live index, but it could NOT be pushed to the QA pairs "
+                        "repo — it will be lost on the next golden QA rebuild. Please tell the admins."
+                    )
+
                 qa_pair_text = f"""🎉 **New Expert-Verified QA Pair Added!**
 
 **Question:** 
@@ -613,7 +669,7 @@ async def add_expert_verified_qa_pair(item_ts, channel_id, expert_user_id):
 
 **Product:** {product}
 
-This QA pair has been automatically added to the golden QA database. Please consider updating the official documentation with this verified information.
+{persistence_note} Please consider updating the official documentation with this verified information.
 
 *Format for official documentation:*
 ```
@@ -784,7 +840,7 @@ async def process_msg(event, say):
     message_ts = event.get("ts")
     conv_id = thread_ts or message_ts
 
-    product, expert_user_id = determine_product_and_expert(channel_id)
+    product = determine_product(channel_id)
     if product is None:
         await say(
             channel=channel_id,
@@ -798,7 +854,7 @@ async def process_msg(event, say):
     text = text_items[1] if len(text_items) == 2 else text_items[0]
 
     is_expert_answering = False
-    if user_id == expert_user_id and text.lower().startswith("#answer"):
+    if text.lower().startswith("#answer") and await expert_resolver.is_expert(user_id, product):
         text = text[7:].lstrip()
         is_expert_answering = True
 
@@ -960,7 +1016,7 @@ async def handle_escalate_to_techsupport(ack, body, client):
 
     warn_if_escalate_body_channel_mismatch(body, orig_channel_id)
 
-    product, _ = determine_product_and_expert(orig_channel_id)
+    product = determine_product(orig_channel_id)
     techsupport_channel_id = get_techsupport_channel(product)
     if not techsupport_channel_id:
         logger.warning(f"[ESCALATE] No techsupport channel configured for product {product} (channel {orig_channel_id})")
@@ -1136,14 +1192,16 @@ async def reaction(event, say):
     item_user = event["item_user"]
     reactor_user_id = event["user"]
 
-    # Determine product and expert for this channel
-    product, expert_user_id = determine_product_and_expert(channel_id)
-    if not product or not expert_user_id:
+    # Determine product for this channel
+    product = determine_product(channel_id)
+    if not product:
         logger.info(f"[IGNORE] Unknown channel {channel_id}, skipping reaction.")
         return
 
-    # Check if the reactor is an expert
-    is_expert = (reactor_user_id == expert_user_id)
+    # Check if the reactor is an expert (a member of the product's expert user group).
+    # An unreadable expert group raises ExpertLookupError out of this handler on
+    # purpose: Bolt logs it, and a silent "nobody is an expert" is worse.
+    is_expert = await expert_resolver.is_expert(reactor_user_id, product)
 
     # 1) Determine if this is a 👍 or a 👎
     reaction_name = event["reaction"]
@@ -1169,11 +1227,12 @@ async def reaction(event, say):
         message_text = first_msg.get("text", "")
         
         # Use helper function to check if this is an expert upvote on a non-chunk
-        if is_expert_upvote(reactor_user_id, "👍", message_text, expert_user_id):
-            logger.info(f"[EXPERT THUMBS UP] Expert {expert_user_id} gave thumbs up to message {item_ts}")
-            await add_expert_verified_qa_pair(item_ts, channel_id, expert_user_id)
+        if is_expert_upvote(is_expert, "👍", message_text):
+            logger.info(f"[EXPERT THUMBS UP] Expert {reactor_user_id} gave thumbs up to message {item_ts}")
+            # DM the expert who actually reacted, not a configured single ID.
+            await add_expert_verified_qa_pair(item_ts, channel_id, reactor_user_id)
         else:
-            logger.info(f"[EXPERT THUMBS UP CHUNK] Expert {expert_user_id} gave thumbs up to chunk {item_ts} - skipping golden QA pair addition")
+            logger.info(f"[EXPERT THUMBS UP CHUNK] Expert {reactor_user_id} gave thumbs up to chunk {item_ts} - skipping golden QA pair addition")
 
     # 3) Handle bot-specific message reactions (for endorsement recording and chunk display)
     if item_user == BOT_USER_ID:
@@ -1239,31 +1298,32 @@ async def check_members(channel_id, user_id):
         print(f"Error occurred: {str(exc)}")
 
 
-def determine_product_and_expert(channel_id):
+def determine_product(channel_id):
     """
-    Determines the product string and expert user ID based on the given channel_id.
+    Determines the product string from a channel_id.
+
+    Experts are a Slack user group per product, so there is no single "the
+    expert" to return alongside it. To decide whether somebody is an expert,
+    call `await expert_resolver.is_expert(user_id, product)`.
 
     Parameters:
     - channel_id (str): The ID of the channel to check.
 
     Returns:
-    - tuple: A tuple containing the product string and the expert user ID.
+    - str or None: the product for this channel, or None if it is not a
+      product channel.
     """
 
     if channel_id == CHANNEL_ID_IDDM or channel_id == ADMIN_CHANNEL_ID_IDDM:
         product = "IDDM"
-        expert_user_id = EXPERT_USER_ID_IDDM
     elif channel_id == CHANNEL_ID_IDA or channel_id == ADMIN_CHANNEL_ID_IDA:
         product = "IDA"
-        expert_user_id = EXPERT_USER_ID_IDA
     elif CHANNEL_ID_IDO and (channel_id == CHANNEL_ID_IDO or channel_id == ADMIN_CHANNEL_ID_IDO):
         product = "IDO"
-        expert_user_id = EXPERT_USER_ID_IDO
     else:
-        product = None
-        expert_user_id = None
+        return None
 
-    return product, expert_user_id
+    return product
 
 
 def get_techsupport_channel(product):
@@ -1402,7 +1462,7 @@ async def get_golden_qa_pairs(ack, body, say):
         )
         return
 
-    product, _ = determine_product_and_expert(channel_id)
+    product = determine_product(channel_id)
 
     if product is None:
         _ = await say(
@@ -1463,7 +1523,7 @@ async def update_golden_qa_pairs(ack, body, say):    # pylint: disable=too-many-
         )
         return
 
-    product, _ = determine_product_and_expert(channel_id)
+    product = determine_product(channel_id)
 
     if not product:
         _ = await say(
@@ -1522,7 +1582,7 @@ async def update_golden_qa_pairs(ack, body, say):    # pylint: disable=too-many-
 #         )
 #         return
 
-#     product, _ = determine_product_and_expert(channel_id)
+#     product = determine_product(channel_id)
 
 #     if product is None:
 #         _ = await say(
@@ -1580,7 +1640,7 @@ async def rebuild_docs_traditional(ack, body, say):
         )
         return
 
-    product, _ = determine_product_and_expert(channel_id)
+    product = determine_product(channel_id)
 
     if product is None:
         _ = await say(
@@ -1638,7 +1698,7 @@ async def rebuild_docs_contextual(ack, body, say):
         )
         return
 
-    product, _ = determine_product_and_expert(channel_id)
+    product = determine_product(channel_id)
 
     if product is None:
         _ = await say(

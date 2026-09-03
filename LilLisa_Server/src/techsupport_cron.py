@@ -7,7 +7,11 @@ they remain a self-contained package that can still be invoked directly
 (`cd cron && make run-nightly`) for one-off ops work.
 
 Runs are serialised by the lock below, so a manual trigger landing during a
-tick run (or vice versa) is dropped rather than queued.
+tick run (or vice versa) is dropped rather than queued. The manual
+product-channel scan (run_product_channel_scan_once, behind POST
+/run_product_channel_scan/) takes the same lock: it touches the same state
+file and the same verified-entry store as the nightly run, so the two must
+never overlap in either direction.
 """
 
 import asyncio
@@ -40,11 +44,12 @@ if CRON_ROOT and str(CRON_ROOT) not in sys.path:
 
 try:
     # Needs CRON_ROOT on sys.path above; the cron package uses flat imports.
-    from nightly_pipeline import run_pipeline  # noqa: E402
+    from nightly_pipeline import run_pipeline, run_product_channel_scan  # noqa: E402
 
     IMPORT_ERROR: Optional[str] = None
 except Exception as exc:  # noqa: BLE001 -- a broken cron install must not stop the API from serving
     run_pipeline = None  # type: ignore[assignment]
+    run_product_channel_scan = None  # type: ignore[assignment]
     IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 _run_lock = threading.Lock()
@@ -56,6 +61,8 @@ def is_available() -> bool:
 
 
 def is_running() -> bool:
+    """True while either the nightly pipeline or a manual product-channel scan
+    is in flight -- they share one lock."""
     return _run_lock.locked()
 
 
@@ -81,6 +88,35 @@ def run_once() -> Dict[str, Any]:
         return {"ran": True, "summary": summary}
     except Exception as exc:  # noqa: BLE001
         utils.logger.critical("Nightly techsupport pipeline failed: %s", exc, exc_info=True)
+        return {"ran": False, "error": str(exc)}
+    finally:
+        _run_lock.release()
+
+
+def run_product_channel_scan_once(force: bool = False) -> Dict[str, Any]:
+    """Run just the product-channel expert-correction pass, unless a run is
+    already in flight.
+
+    The companion to run_once() for POST /run_product_channel_scan/: same
+    lock, same "drop rather than queue" behaviour, same never-raises contract
+    (the caller is a FastAPI BackgroundTask, which would swallow the
+    exception). `force` bypasses the per-channel interval gate.
+    """
+    if run_product_channel_scan is None:
+        utils.logger.error("Product-channel scan unavailable: %s", IMPORT_ERROR)
+        return {"ran": False, "reason": "unavailable", "error": IMPORT_ERROR}
+
+    if not _run_lock.acquire(blocking=False):
+        utils.logger.info("Techsupport pipeline already running -- ignoring this product-channel scan trigger")
+        return {"ran": False, "reason": "already_running"}
+
+    try:
+        utils.logger.info("Product-channel expert-correction scan starting (force=%s)", force)
+        summary = run_product_channel_scan(force=force)
+        utils.logger.info("Product-channel expert-correction scan finished: %s", summary)
+        return {"ran": True, "summary": summary}
+    except Exception as exc:  # noqa: BLE001
+        utils.logger.critical("Product-channel expert-correction scan failed: %s", exc, exc_info=True)
         return {"ran": False, "error": str(exc)}
     finally:
         _run_lock.release()
