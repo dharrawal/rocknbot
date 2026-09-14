@@ -246,6 +246,8 @@ Like `/run_nightly_pipeline/`, it returns immediately and runs as a FastAPI back
 
 One new scope is needed: **`usergroups:read`**. Everything else in the escalation flow and the nightly scripts is covered by the existing bot token and scopes (`app_mentions:read`, `chat:write`, `im:write`, `channels:history`, `channels:read`, `im:history`).
 
+Event Subscriptions also need to be turned on alongside the bot token scopes above. Go to the Slack app's Event Subscriptions page, enable it, and subscribe to `message.channels` and `app_mention` under bot events. If you skip this, the bot will connect fine and look healthy, but it won't receive any messages at all. This applies any time you're setting up a brand new Slack app.
+
 `usergroups:read` lets the bot call `usergroups.users.list` to resolve the per-product expert user groups (`EXPERT_GROUP_ID_IDA` / `_IDDM` / `_IDO`, Section 2). Add the scope and reinstall the app **before** deploying: without it every expert lookup fails loudly (`ExpertLookupError` out of the Slack handlers, an errored product in the nightly pass) instead of quietly treating everyone as a non-expert.
 
 ### 6a. Expert user groups: what to set up
