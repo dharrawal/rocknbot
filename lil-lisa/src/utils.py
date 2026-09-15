@@ -1,10 +1,124 @@
 """ utility functions """
 
+import json
 import logging
 import os
 from datetime import datetime, timezone
 from time import time_ns
-from typing import Optional
+from typing import Any, Dict, Optional
+
+
+def parse_get_ans_result(raw_result: str) -> Dict[str, Any]:
+    """Parse LilLisa_Server /invoke/ JSON.
+
+    get_ans() returns a JSON object on success, but a plain English string on
+    timeout/exception. json.loads() of that string must not crash process_msg
+    and leave Slack showing only "Processing...".
+    """
+    try:
+        parsed = json.loads(raw_result)
+    except (json.JSONDecodeError, TypeError):
+        return {
+            "response": str(raw_result),
+            "links_text": "",
+            "reranked_nodes": [],
+            "needs_escalation": False,
+        }
+    if not isinstance(parsed, dict):
+        return {
+            "response": str(raw_result),
+            "links_text": "",
+            "reranked_nodes": [],
+            "needs_escalation": False,
+        }
+    return parsed
+
+
+def truncate_preserving_code_fences(text: str, max_length: int) -> str:
+    """Truncate text without leaving an unclosed ``` fence (Slack mrkdwn).
+
+    Same approach as LilLisa_Server `_truncate_match_answer`: if a hard slice
+    would land inside a fence, cut before that fence; if the window is only the
+    first fence, close it instead of dropping all text.
+    """
+    if len(text) <= max_length:
+        return text
+    truncated = text[:max_length]
+    if truncated.count("```") % 2 != 0:
+        fence_index = truncated.rfind("```")
+        before_fence = truncated[:fence_index].rstrip()
+        if before_fence:
+            return before_fence + "..."
+        return truncated + "\n```..."
+    return truncated + "..."
+
+
+SLACK_ACTION_VALUE_MAX = 2000
+ESCALATE_VALUE_QUERY_MAX_LENGTH = 1500
+
+
+def build_escalation_button_value(
+    query: str,
+    channel_id: str,
+    thread_ts: str,
+    session_id,
+    user_id: str,
+    primary_techsupport_match_title: str = None,
+) -> str:
+    """Encode escalate-button state. Slack action `value` is capped at 2000 chars."""
+    value: Dict[str, Any] = {
+        "query": query[:ESCALATE_VALUE_QUERY_MAX_LENGTH],
+        "channel_id": channel_id,
+        "thread_ts": thread_ts,
+        "session_id": str(session_id),
+        "user_id": user_id,
+    }
+    encoded = json.dumps(value)
+    if not primary_techsupport_match_title:
+        return encoded
+    title = primary_techsupport_match_title
+    while True:
+        candidate = dict(value)
+        candidate["primary_techsupport_match_title"] = title
+        blob = json.dumps(candidate)
+        if len(blob) <= SLACK_ACTION_VALUE_MAX:
+            return blob
+        if len(title) <= 1:
+            return encoded
+        title = title[: max(0, len(title) - 32)]
+
+
+def warn_if_escalate_body_channel_mismatch(body: Optional[Dict[str, Any]], orig_channel_id: Optional[str]) -> bool:
+    """Warn when Slack interaction body.channel.id differs from button payload channel_id.
+
+    Escalation chat_update/posts use orig_channel_id from the button payload only.
+    body.channel can differ (e.g. forwarded messages) and must not be used for those calls.
+    Returns True when a warning was logged.
+    """
+    if not body or not orig_channel_id:
+        return False
+    body_channel_id = (body.get("channel") or {}).get("id")
+    if body_channel_id and body_channel_id != orig_channel_id:
+        logger.warning(
+            f"[ESCALATE] Slack body channel id {body_channel_id!r} differs from "
+            f"button payload channel_id {orig_channel_id!r}; using payload channel_id"
+        )
+        return True
+    return False
+
+
+def assert_shared_techsupport_channel_ids(product_channels: Dict[str, Optional[str]]) -> None:
+    """Production uses one shared tech-support channel for IDA/IDDM/IDO.
+
+    Configured (non-empty) IDs must all be equal. Unset products are ignored.
+    """
+    nonempty = {name: channel_id for name, channel_id in product_channels.items() if channel_id}
+    unique = set(nonempty.values())
+    if len(unique) > 1:
+        raise ValueError(
+            "TECHSUPPORT_CHANNEL_ID_IDA / _IDDM / _IDO must all be the same shared "
+            f"channel; got {nonempty}"
+        )
 
 
 def get_env_variable(var_name: str, default: Optional[str] = None) -> str:

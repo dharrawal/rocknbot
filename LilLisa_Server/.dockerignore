@@ -1,0 +1,26 @@
+# Build context for the API images is this directory. Without the excludes
+# below the context is several GB of virtualenv and local LanceDB data.
+# Note: dockerfile_lancedb deliberately COPYs lancedb/, so that one is not
+# excluded here -- see the build target it belongs to.
+
+.venv/
+cron/.venv/
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Runtime state: belongs on a mounted volume, never baked into the image
+speedict/
+cron/*_state.json
+
+# Not needed at runtime
+build/
+tests/
+smoke/
+visuals/
+uv.lock
+cron/tests/
+*.md

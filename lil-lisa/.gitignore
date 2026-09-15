@@ -7,13 +7,17 @@
 .mypy_cache/
 
 # Ignore app environment files
-app_envfiles/
+app_envfiles/*
+!app_envfiles/*.example
 
 # Ignore Docker ignore files
 .dockerignore
 
 # Ignore Python bytecode cache
 __pycache__/
+
+# Persist Slack silence-after-escalate across bot restarts (90-day TTL).
+escalation_tracker.json
 
 # Ignore test configuration
 conftest.py

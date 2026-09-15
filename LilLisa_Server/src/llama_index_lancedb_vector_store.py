@@ -41,6 +41,19 @@ from src import utils
 _logger = logging.getLogger(__name__)
 
 
+def _sql_string_literal(value: Any) -> str:
+    """SQL string literal for LanceDB delete/where predicates.
+
+    LanceDB's Python API takes a SQL predicate string; it does not expose
+    bound parameters. Single quotes are doubled per SQL.
+    """
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _sql_in_clause(column: str, values: List[Any]) -> str:
+    return f"{column} in ({', '.join(_sql_string_literal(v) for v in values)})"
+
+
 def _to_lance_filter(standard_filters: MetadataFilters, metadata_keys: list) -> Any:
     """Translate standard metadata filters to Lance specific spec."""
     filters = []
@@ -85,7 +98,9 @@ class LanceDBVectorStore(BasePydanticVectorStore):
 
     stores_text: bool = True
     flat_metadata: bool = True
-    uri: Optional[str] = "/tmp/lancedb"
+    # Upstream llama-index default, kept for parity. Callers here always pass
+    # LANCEDB_FOLDERPATH, so this /tmp path is never actually used.
+    uri: Optional[str] = "/tmp/lancedb"  # nosec B108
     vector_column_name: Optional[str] = "vector"
     nprobes: Optional[int] = 20
     refine_factor: Optional[int] = None
@@ -106,7 +121,8 @@ class LanceDBVectorStore(BasePydanticVectorStore):
 
     def __init__(
         self,
-        uri: Optional[str] = "/tmp/lancedb",
+        # Same upstream default as the class attribute above; always overridden.
+        uri: Optional[str] = "/tmp/lancedb",  # nosec B108
         table_name: Optional[str] = "vectors",
         vector_column_name: str = "vector",
         nprobes: int = 20,
@@ -170,7 +186,8 @@ class LanceDBVectorStore(BasePydanticVectorStore):
 
         if table is not None:
             try:
-                assert isinstance(table, (lancedb.db.LanceTable, lancedb.remote.table.RemoteTable))
+                # Upstream type guard; the except below turns it into a ValueError.
+                assert isinstance(table, (lancedb.db.LanceTable, lancedb.remote.table.RemoteTable))  # nosec B101
                 object.__setattr__(self, "_table", table)
                 object.__setattr__(self, "_table_name", table.name if hasattr(table, "name") else "remote_table")
             except AssertionError:
@@ -272,13 +289,15 @@ class LanceDBVectorStore(BasePydanticVectorStore):
         """
         Delete nodes using the ref_doc_id.
         """
-        self._table.delete(f'{self.doc_id_key} = "' + ref_doc_id + '"')
+        self._table.delete(f"{self.doc_id_key} = {_sql_string_literal(ref_doc_id)}")
 
     def delete_nodes(self, node_ids: List[str], **delete_kwargs: Any) -> None:
         """
         Delete nodes using a list of node_ids.
         """
-        self._table.delete('id in ("' + '","'.join(node_ids) + '")')
+        if not node_ids:
+            return
+        self._table.delete(_sql_in_clause("id", node_ids))
 
     def get_nodes(
         self,
@@ -298,7 +317,9 @@ class LanceDBVectorStore(BasePydanticVectorStore):
         else:
             where = kwargs.pop("where", None)
         if node_ids is not None:
-            where = 'id in ("' + '","'.join(node_ids) + '")'
+            if not node_ids:
+                return []
+            where = _sql_in_clause("id", node_ids)
         results = self._table.search().where(where).to_pandas()
         nodes = []
         for _, item in results.iterrows():

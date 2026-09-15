@@ -13,10 +13,9 @@ LDB_TAG=2.6.0
 
 .EXPORT_ALL_VARIABLES:
 
-.PHONY: _include-env
-
-_include-env:
-    include ./env/lillisa_server.env
+# Optional so make works without env; copy from *.example before deploy/run.
+# Keep examples as unquoted KEY=value, no export, no inline comments (Make include ≠ python-dotenv).
+-include ./env/lillisa_server.env
 
 _wait30s:
 	@echo "lets wait 30 sec..."
@@ -34,7 +33,7 @@ VENV_BIN = .venv/bin
 _lint:
 	$(VENV_BIN)/isort .
 	$(VENV_BIN)/black .
-	$(VENV_BIN)/flake8 . --ignore E501,E122,W503,E402
+	$(VENV_BIN)/flake8 . --ignore E501,E122,W503,E402 --exclude .venv
 	$(VENV_BIN)/pylint --recursive=y .
 	$(VENV_BIN)/mypy --install-types --non-interactive .
 	$(VENV_BIN)/mypy .

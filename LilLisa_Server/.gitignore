@@ -5,10 +5,23 @@
 .mypy_cache/
 
 # Ignore app environment files
-env/
+env/*
+!env/*.example
+
+# Ignore tool-specific credential env files if any remain under scripts/env
+scripts/env/*
+!scripts/env/*.example
+
+# Escalation tags written by POST /tag_techsupport_thread/ (API process).
+# Cron jobs live in cron/ and read this same path.
+scripts/techsupport_thread_tags.json
+# Cited-entry tags written by invoke() at answer time (same reader).
+scripts/techsupport_answer_tags.json
 
 # Ignore Docker ignore files
-.dockerignore
+# Exception: the image build now depends on .dockerignore to keep .venv and
+# lancedb out of the build context, so that one file is tracked.
+!.dockerignore
 
 # Ignore Python bytecode cache
 __pycache__/
@@ -29,3 +42,8 @@ lancedb/*/_indices
 
 # Ignore passwords
 passwords/
+
+# Ignore local Slack harvest dumps under data/historical_import/
+# Keep .gitkeep so the empty directory exists for scripts that assume the path.
+data/historical_import/*
+!data/historical_import/.gitkeep

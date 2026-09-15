@@ -26,6 +26,11 @@ dependencies = [
     "opentelemetry-instrumentation-fastapi==0.54b0",
     "opentelemetry-exporter-otlp==1.33.0",
     "voyageai==0.3.4",
+    # cron/ (nightly techsupport pipeline) runs both standalone and in this
+    # process via src/techsupport_cron.py, so its deps ship here rather than in
+    # a second venv.
+    "dspy>=2.6.27",
+    "requests>=2.31,<3",
 ]
 
 [project.optional-dependencies]
@@ -35,7 +40,9 @@ dev = [
     "flake8==6.0.0",
     "pylint==2.16.1",
     "mypy==1.0.0",
-    "bandit[toml]==1.7.4",
+    # 1.7.4 imports pbr.version at runtime but never declares it, so the
+    # bandit step of `make _lint` died with ModuleNotFoundError.
+    "bandit[toml]>=1.8.6",
 ]
 
 [tool.uv]
@@ -71,4 +78,6 @@ module = [
 ignore_missing_imports = true
 
 [tool.bandit]
-exclude_dirs = ["test"]
+# .venv holds ~4.7M lines of third-party code; without it every run drowned
+# in ~16k findings from dependencies and told us nothing about this project.
+exclude_dirs = ["test", "tests", "./.venv", "./visuals"]

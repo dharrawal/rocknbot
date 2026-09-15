@@ -22,7 +22,6 @@ import jwt
 import litellm
 import tiktoken
 import uvicorn
-import voyageai
 from fastapi import FastAPI, HTTPException, status, BackgroundTasks, Request, Response, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
@@ -47,7 +46,6 @@ from llama_index.core.ingestion import IngestionPipeline
 from llama_index.core.llms import LLM, ChatMessage, ChatResponse, LLMMetadata
 from llama_index.core.node_parser import MarkdownNodeParser, SentenceSplitter
 from llama_index.core.tools import FunctionTool
-from llama_index.core.embeddings import BaseEmbedding
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.llms.openai import OpenAI as OpenAI_Llama
 from speedict import Rdict
@@ -64,14 +62,19 @@ from src.agent_and_tools import (
     get_matching_versions,
     handle_user_answer,
     improve_query,
+    refine_escalation_query,
     create_lancedb_retrievers_and_indices,
     create_docdbs_lancedb_retrievers_and_indices,
     create_qa_pairs_lancedb_retrievers_and_indices,
 )
+from src import golden_qa_sync
+from src.embedding_config import VoyageEmbedding, VOYAGE_EMBEDDING_DIMENSION
 from src.lillisa_server_context import LOCALE, LilLisaServerContext
 from src.llama_index_lancedb_vector_store import LanceDBVectorStore
 from src.llama_index_markdown_reader import MarkdownReader
 
+from src.techsupport_thread_tags import THREAD_TAGS_LOCK, upsert_answer_tag, upsert_thread_tag
+from src import techsupport_cron
 from src import observability
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
@@ -90,6 +93,9 @@ class ChunkingStrategy(Enum):
 REACT_AGENT_PROMPT = None  # Path to the React agent prompt file
 LANCEDB_FOLDERPATH = None  # Path to the LanceDB folder
 AUTHENTICATION_KEY = None  # Authentication key for JWT
+# Max character length of conversation_history posted to /refine_escalation_query/.
+# Long enough for a real multi-turn Slack session; short enough to reject LLM cost/DoS padding.
+REFINE_ESCALATION_MAX_CHARS = 32768
 DOCUMENTATION_FOLDERPATH = None  # Path to the documentation folder
 QA_PAIRS_GITHUB_REPO_URL = None  # URL of the GitHub repository for QA pairs
 QA_PAIRS_FOLDERPATH = None  # Path to the QA pairs folder
@@ -103,9 +109,6 @@ MAX_ITERATIONS = None  # Maximum number of iterations for the ReAct agent
 LLM_MODEL = None  # Model name
 SESSION_LIFETIME_DAYS = None  # Session lifetime in days
 CURRENT_CHUNKING_STRATEGY = ChunkingStrategy.CONTEXTUAL  # Current active chunking strategy
-
-# Voyage AI configuration
-VOYAGE_EMBEDDING_DIMENSION = 2048  # Embedding dimension for Voyage AI model
 
 # Humorous placeholder messages streamed as "thinking" indicators while the pipeline runs
 THINKING_MESSAGES = [
@@ -411,84 +414,6 @@ class StreamingReActAgent(ReActAgent):
 
 
 # -----------------------------------------------------------------------------
-# Custom Voyage Embedding Implementation
-# -----------------------------------------------------------------------------
-class VoyageEmbedding(BaseEmbedding):
-    """Voyage AI embedding implementation."""
-    
-    model_name: str = "voyage-context-3"
-    output_dimension: int = VOYAGE_EMBEDDING_DIMENSION
-    client: voyageai.Client = None
-    
-    def __init__(self, model: str = "voyage-context-3", output_dimension: int = VOYAGE_EMBEDDING_DIMENSION, **kwargs):
-        super().__init__(**kwargs)
-        self.model_name = model
-        self.output_dimension = output_dimension
-        # Direct client initialization - no lazy loading needed
-        self.client = voyageai.Client()
-    
-    def _get_query_embedding(self, query: str) -> List[float]:
-        """Get embedding for a single query - direct API call."""
-        result = self.client.contextualized_embed(
-            inputs=[[query]], 
-            model=self.model_name, 
-            input_type="query",
-            output_dimension=self.output_dimension
-        )
-        return result.results[0].embeddings[0]
-    
-    def _get_text_embedding(self, text: str) -> List[float]:
-        """Get embedding for a single text (used for queries)."""
-        return self._get_query_embedding(text)
-    
-    def _get_text_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Get embeddings for multiple texts - direct batch API call."""
-        inputs = [[text] for text in texts]
-        result = self.client.contextualized_embed(
-            inputs=inputs, 
-            model=self.model_name, 
-            input_type="query",
-            output_dimension=self.output_dimension
-        )
-        return [res.embeddings[0] for res in result.results]
-    
-    # Required async methods for BaseEmbedding compatibility
-    async def _aget_query_embedding(self, query: str) -> List[float]:
-        """Async version - just calls sync method since Voyage client is sync."""
-        return self._get_query_embedding(query)
-    
-    async def _aget_text_embedding(self, text: str) -> List[float]:
-        """Async version - just calls sync method since Voyage client is sync."""
-        return self._get_text_embedding(text)
-    
-    async def _aget_text_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Async version - just calls sync method since Voyage client is sync."""
-        return self._get_text_embeddings(texts)
-
-    @classmethod
-    def get_contextualized_embeddings(cls, documents_chunks: List[List[str]], model: str = "voyage-context-3", output_dimension: int = VOYAGE_EMBEDDING_DIMENSION) -> List[List[List[float]]]:
-        """
-        Get contextualized embeddings for document chunks.
-        
-        Args:
-            documents_chunks: List of documents, where each document is a list of chunks
-            model: Voyage model name
-            output_dimension: Output dimension for embeddings
-            
-        Returns:
-            List of embeddings for each document, where each document contains embeddings for its chunks
-        """
-        client = voyageai.Client()
-        result = client.contextualized_embed(
-            inputs=documents_chunks,
-            model=model,
-            input_type="document",
-            output_dimension=output_dimension
-        )
-        return [res.embeddings for res in result.results]
-
-
-# -----------------------------------------------------------------------------
 # Application Lifecycle Management
 # -----------------------------------------------------------------------------
 @asynccontextmanager
@@ -629,8 +554,11 @@ async def lifespan(_app: FastAPI):
         await init_lance_databases()
     else:
         create_lancedb_retrievers_and_indices(LANCEDB_FOLDERPATH)
-    
+
+    pipeline_scheduler_task = techsupport_cron.start_scheduler()
+
     yield
+    await techsupport_cron.stop_scheduler(pipeline_scheduler_task)
     os.unsetenv("OPENAI_API_KEY")
     os.unsetenv("VOYAGE_API_KEY")
     litellm.api_key = None
@@ -756,7 +684,14 @@ async def invoke_stream_with_nodes(
     Raises:
         HTTPException: On internal errors or invalid input.
     """
-    utils.logger.info("session_id: %s, locale: %s, product: %s, nl_query: %s", session_id, locale, product, nl_query)
+    utils.logger.info(
+        "invoke_stream session_id=%s locale=%s product=%s query_chars=%s",
+        session_id, locale, product, len(nl_query or ""),
+    )
+    utils.logger.debug(
+        "session_id: %s, locale: %s, product: %s, nl_query: %s",
+        session_id, locale, product, nl_query,
+    )
     
     # Validate and auto-correct embedding model compatibility
     validate_embedding_compatibility()
@@ -837,7 +772,8 @@ async def invoke_stream_with_nodes(
             if not available:
                 used_indices.clear()
                 available = list(range(len(THINKING_MESSAGES)))
-            idx = random.choice(available)
+            # Cosmetic "thinking" message selection, not security-relevant.
+            idx = random.choice(available)  # nosec B311
             used_indices.add(idx)
             yield f"COT: {THINKING_MESSAGES[idx]}\n"
             await asyncio.sleep(1.5)
@@ -882,6 +818,32 @@ async def invoke_stream_with_nodes(
 
     return StreamingResponse(streamer(), media_type="text/html", headers=custom_headers)
 
+def _log_invoke_heartbeat(
+    *,
+    session_id: str,
+    locale: str,
+    product: str,
+    is_followup: bool,
+    query_chars: int,
+    elapsed_ms: float,
+    outcome: str,
+    answer_found: Optional[bool] = None,
+) -> None:
+    """INFO line so ops can confirm Slack hit /invoke/ without logging the query text."""
+    utils.logger.info(
+        "invoke session_id=%s locale=%s product=%s followup=%s query_chars=%s "
+        "answer_found=%s elapsed_ms=%.0f outcome=%s",
+        session_id,
+        locale,
+        product,
+        is_followup,
+        query_chars,
+        answer_found,
+        elapsed_ms,
+        outcome,
+    )
+
+
 @app.post("/invoke/", response_model=dict, response_class=JSONResponse)
 def invoke(
     session_id: str,
@@ -908,9 +870,14 @@ def invoke(
         HTTPException: On internal errors or invalid input.
     """
     nodes = []
+    t0_invoke = time.perf_counter()
+    query_chars = len(nl_query or "")
     try:
-        utils.logger.info("session_id: %s, locale: %s, product: %s, nl_query: %s, Follow_up: %s", session_id, locale, product, nl_query, is_followup)
-        
+        utils.logger.debug(
+            "session_id: %s, locale: %s, product: %s, nl_query: %s, Follow_up: %s",
+            session_id, locale, product, nl_query, is_followup,
+        )
+
         # Validate and auto-correct embedding model compatibility
         validate_embedding_compatibility()
         
@@ -921,6 +888,15 @@ def invoke(
             try:
                 keyvalue_db = Rdict(db_folderpath)
                 if session_id not in keyvalue_db:
+                    _log_invoke_heartbeat(
+                        session_id=session_id,
+                        locale=locale,
+                        product=product,
+                        is_followup=is_followup,
+                        query_chars=query_chars,
+                        elapsed_ms=(time.perf_counter() - t0_invoke) * 1000,
+                        outcome="session_expired",
+                    )
                     return JSONResponse(content={
                         "response": "This session is expired, start a new conversation.",
                         "reranked_nodes": [],
@@ -939,6 +915,15 @@ def invoke(
         # Handle expert answering case
         if is_expert_answering:
             llsc.add_to_conversation_history("Expert", nl_query, query_id)
+            _log_invoke_heartbeat(
+                session_id=session_id,
+                locale=locale,
+                product=product,
+                is_followup=is_followup,
+                query_chars=query_chars,
+                elapsed_ms=(time.perf_counter() - t0_invoke) * 1000,
+                outcome="expert_passthrough",
+            )
             return JSONResponse(content={
                 "response": nl_query,
                 "reranked_nodes": [],
@@ -971,10 +956,33 @@ def invoke(
         try:
             response_dict = json.loads(raw_response)
             response_text = response_dict.get("response", raw_response)
+            links_text = response_dict.get("links_text", "")
             nodes = response_dict.get("reranked_nodes", [])
+            answer_found = response_dict.get("answer_found", True)
+            primary_techsupport_match_title = response_dict.get("primary_techsupport_match_title")
         except json.JSONDecodeError:
             response_text = raw_response
+            links_text = ""
             nodes = []
+            answer_found = True
+            primary_techsupport_match_title = None
+
+        if primary_techsupport_match_title:
+            # Nightly product-channel pass reads this (get_cited_entry_title) to tell an
+            # expert correction of a cited entry from a brand-new Q&A. Best-effort only.
+            try:
+                upsert_answer_tag(session_id, primary_techsupport_match_title)
+            except Exception as tag_exc:  # pylint:disable=broad-except
+                utils.logger.warning(
+                    "Failed to record techsupport answer tag for session %s: %s", session_id, tag_exc
+                )
+
+        needs_escalation = not answer_found
+
+        utils.logger.debug(
+            "DEBUG_NO_ANSWER | session_id=%s answer_found=%s needs_escalation=%s response_text=%r",
+            session_id, answer_found, needs_escalation, response_text,
+        )
 
         # Add assistant and user response to conversation history
         llsc.add_to_conversation_history("Assistant", response_text, query_id)
@@ -990,17 +998,43 @@ def invoke(
             llsc.save_context()
             utils.logger.debug("PERF | save_context | %.3fs", time.perf_counter() - t0_save)
 
+        _log_invoke_heartbeat(
+            session_id=session_id,
+            locale=locale,
+            product=product,
+            is_followup=is_followup,
+            query_chars=query_chars,
+            elapsed_ms=(time.perf_counter() - t0_invoke) * 1000,
+            outcome="ok",
+            answer_found=answer_found,
+        )
         # Return JSON response
         return JSONResponse(content={
             "response": response_text,
+            "links_text": links_text,
             "reranked_nodes": nodes,
-            "query_id": query_id
+            "query_id": query_id,
+            "answer_found": answer_found,
+            "needs_escalation": needs_escalation,
+            "primary_techsupport_match_title": primary_techsupport_match_title
         },headers=custom_headers)
 
     except HTTPException as exc:
         raise exc
     except Exception as exc:
-        utils.logger.critical("Internal error in invoke() for session_id: %s, nl_query: %s. Error: %s", session_id, nl_query, exc)
+        _log_invoke_heartbeat(
+            session_id=session_id,
+            locale=locale,
+            product=product,
+            is_followup=is_followup,
+            query_chars=query_chars,
+            elapsed_ms=(time.perf_counter() - t0_invoke) * 1000,
+            outcome="error",
+        )
+        utils.logger.critical(
+            "Internal error in invoke() for session_id: %s, query_chars: %s. Error: %s",
+            session_id, query_chars, exc,
+        )
         raise HTTPException(status_code=500, detail=f"Internal error in invoke() for session_id: {session_id}") from exc
 
 @app.post("/add_expert_qa_pair/", response_model=dict, response_class=JSONResponse)
@@ -1055,7 +1089,22 @@ async def add_expert_qa_pair(
         
         # Add to LanceDB QA pairs table (this appends to existing table, doesn't replace it)
         await _add_qa_pair_to_lancedb(question, answer, product)
-        
+
+        # ...and push the same pair to the golden QA pairs repo, so it survives
+        # _run_update_golden_qa_pairs_task(), which drops the LanceDB table and
+        # rebuilds it purely from that repo. Blocking git work, so off the event
+        # loop; never raises, so a failed push cannot undo the LanceDB insert.
+        push_result = await asyncio.to_thread(
+            golden_qa_sync.append_expert_qa_pair_to_repo, product, question, answer
+        )
+        pushed = bool(push_result.get("pushed"))
+        if not pushed:
+            utils.logger.error(
+                "Expert QA pair stored in LanceDB but NOT pushed to the golden QA repo "
+                "(it will be lost on the next golden QA rebuild): %s",
+                push_result.get("error"),
+            )
+
         # Log the expert verification
         timestamp = datetime.now(timezone.utc).isoformat()
         log_entry = {
@@ -1069,12 +1118,17 @@ async def add_expert_qa_pair(
             "answer": answer
         }
         utils.logger.info(f"Expert QA Verification: {json.dumps(log_entry)}")
-        
+
         return JSONResponse(content={
             "success": True,
-            "message": "QA pair added successfully",
+            "message": (
+                "QA pair added successfully"
+                if pushed
+                else "QA pair added to the index, but could not be pushed to the golden QA repo"
+            ),
             "question": question,
-            "answer": answer
+            "answer": answer,
+            "pushed": pushed
         })
         
     except jwt.exceptions.InvalidSignatureError as e:
@@ -1158,6 +1212,171 @@ async def _add_qa_pair_to_lancedb(question: str, answer: str, product: str):
     except Exception as e:
         utils.logger.error(f"Failed to add expert QA pair to {product} LanceDB table: {e}", exc_info=True)
         raise
+
+
+@app.post("/reload_techsupport_qa_pairs/", response_model=dict, response_class=JSONResponse)
+async def reload_techsupport_qa_pairs(encrypted_key: str) -> dict:
+    """
+    Rebuilds the in-memory QA pairs retrievers/indices (including
+    TECHSUPPORT_QA_PAIRS) from the current on-disk LanceDB tables.
+
+    cron/nightly_pipeline.py and techsupport_qa_ingest.py write new
+    verified techsupport entries directly to LanceDB, entirely out-of-process
+    from this server -- unlike add_expert_qa_pair above, which is called from
+    within a running request here. Without this endpoint, a long-running
+    server process's TECHSUPPORT_QA_PAIRS_RETRIEVER stays frozen at whatever
+    it was at last startup (or last call to this endpoint / add_expert_qa_pair
+    / update_golden_qa_pairs, which all rebuild via the same
+    create_qa_pairs_lancedb_retrievers_and_indices() call), so newly-added
+    techsupport content is invisible to live queries until something calls
+    this. The nightly pipeline calls this after a successful add/replace so
+    new content is queryable immediately, no restart required.
+
+    Cheap and synchronous (just reopens the on-disk LanceDB tables and wraps
+    them in fresh VectorStoreIndex/retriever objects -- no network I/O),
+    unlike update_golden_qa_pairs's background-task GitHub-clone rebuild.
+
+    Args:
+        encrypted_key (str): JWT key for authentication.
+
+    Returns:
+        dict: Success status.
+    """
+    try:
+        jwt.decode(encrypted_key, AUTHENTICATION_KEY, algorithms="HS256")
+        create_qa_pairs_lancedb_retrievers_and_indices(LANCEDB_FOLDERPATH)
+        utils.logger.info("Reloaded QA pairs retrievers/indices (including TECHSUPPORT_QA_PAIRS) on request")
+        return {"success": True, "message": "QA pairs retrievers/indices reloaded"}
+    except jwt.exceptions.InvalidSignatureError as e:
+        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
+    except Exception as exc:
+        utils.logger.critical("Internal error in reload_techsupport_qa_pairs(). Error: %s", exc)
+        raise HTTPException(status_code=500, detail="Internal error in reload_techsupport_qa_pairs()") from exc
+
+
+@app.post("/run_nightly_pipeline/", response_model=str, response_class=PlainTextResponse)
+async def run_nightly_pipeline(encrypted_key: str, background_tasks: BackgroundTasks) -> str:
+    """
+    Runs cron/nightly_pipeline.py in this process, in the background.
+
+    Same code host cron runs; this is the trigger for deployments where the API
+    image is the only thing shipped (no host access, no second container). An
+    external scheduler can POST here on a timer, and ops can POST manually to
+    force a run. The pipeline is self-gating on TECHSUPPORT_SYNC_INTERVAL_HOURS,
+    so an extra call is cheap rather than harmful.
+
+    Overlapping calls are dropped rather than queued -- see techsupport_cron.run_once.
+
+    Args:
+        encrypted_key (str): JWT key for authentication.
+        background_tasks (BackgroundTasks): FastAPI background task manager.
+
+    Returns:
+        str: Immediate confirmation message (the run itself takes minutes).
+    """
+    try:
+        jwt.decode(encrypted_key, AUTHENTICATION_KEY, algorithms="HS256")
+    except jwt.exceptions.InvalidSignatureError as e:
+        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
+
+    if not techsupport_cron.is_available():
+        utils.logger.error(
+            "run_nightly_pipeline() requested but the cron package is unavailable: %s", techsupport_cron.IMPORT_ERROR
+        )
+        raise HTTPException(status_code=503, detail="Nightly techsupport pipeline is not installed in this image.")
+
+    if techsupport_cron.is_running():
+        return "Nightly techsupport pipeline is already running. This request was ignored."
+
+    background_tasks.add_task(techsupport_cron.run_once)
+    return "Nightly techsupport pipeline initiated. Progress and the run summary are in the server logs."
+
+
+@app.post("/run_product_channel_scan/", response_model=str, response_class=PlainTextResponse)
+async def run_product_channel_scan(encrypted_key: str, background_tasks: BackgroundTasks, force: bool = True) -> str:
+    """
+    Runs only the product-channel expert-correction pass, in this process, in the background.
+
+    The narrow sibling of /run_nightly_pipeline/: it scans the IDA/IDDM/IDO
+    channels for expert replies and publishes what changed (GitHub push plus
+    index reload), but skips the tech support loop, the review sync and the
+    contextual re-embed.
+
+    `force` defaults to True because a manual trigger is an operator saying
+    "scan now": with the default, the per-channel TECHSUPPORT_SYNC_INTERVAL_HOURS
+    gate is bypassed and every configured channel is scanned. Pass force=false
+    to respect that gate, i.e. to behave exactly like the nightly run.
+
+    Shares one lock with the nightly pipeline, so a scan landing during a
+    nightly run (or vice versa) is dropped rather than queued -- see
+    techsupport_cron.run_product_channel_scan_once.
+
+    Args:
+        encrypted_key (str): JWT key for authentication.
+        background_tasks (BackgroundTasks): FastAPI background task manager.
+        force (bool): Bypass the per-channel interval gate. Defaults to True.
+
+    Returns:
+        str: Immediate confirmation message (the scan itself takes minutes).
+    """
+    try:
+        _require_jwt(encrypted_key)
+    except jwt.exceptions.InvalidSignatureError as e:
+        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
+
+    if not techsupport_cron.is_available():
+        utils.logger.error(
+            "run_product_channel_scan() requested but the cron package is unavailable: %s",
+            techsupport_cron.IMPORT_ERROR,
+        )
+        raise HTTPException(status_code=503, detail="Nightly techsupport pipeline is not installed in this image.")
+
+    if techsupport_cron.is_running():
+        return "Techsupport pipeline is already running. This request was ignored."
+
+    background_tasks.add_task(techsupport_cron.run_product_channel_scan_once, force)
+    return "Product-channel expert-correction scan initiated. Progress and the run summary are in the server logs."
+
+
+# Written here by this API process. The cron/ jobs read the same path
+# (paths.THREAD_TAGS_PATH); do not move this file into the cron package.
+TECHSUPPORT_THREAD_TAGS_PATH = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "techsupport_thread_tags.json"
+
+
+def _require_jwt(encrypted_key: str) -> None:
+    """Same AUTHENTICATION_KEY check used by /reload_techsupport_qa_pairs/ and golden-QA admin routes."""
+    jwt.decode(encrypted_key, AUTHENTICATION_KEY, algorithms="HS256")
+
+
+@app.post("/tag_techsupport_thread/", response_model=str, response_class=PlainTextResponse)
+async def tag_techsupport_thread(thread_ts: str, related_entry_title: str, encrypted_key: str) -> str:
+    """
+    Records that a newly-created techsupport escalation thread is related to an existing
+    verified techsupport entry, so the nightly pipeline can merge new insight into that
+    entry (enrich_verified_entry) instead of adding a duplicate. Read by
+    techsupport_qa_ingest.get_related_entry_title() via nightly_pipeline.py.
+
+    Args:
+        thread_ts (str): Slack ts of the newly-created techsupport channel thread.
+        related_entry_title (str): Title of the existing verified entry this thread relates to.
+        encrypted_key (str): JWT key for authentication (same secret as /reload_techsupport_qa_pairs/).
+
+    Returns:
+        str: "ok" on success.
+
+    Raises:
+        HTTPException: 401 on bad JWT, 500 on internal errors.
+    """
+    try:
+        _require_jwt(encrypted_key)
+        async with THREAD_TAGS_LOCK:
+            upsert_thread_tag(thread_ts, related_entry_title, path=TECHSUPPORT_THREAD_TAGS_PATH)
+        return "ok"
+    except jwt.exceptions.InvalidSignatureError as e:
+        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
+    except Exception as exc:
+        utils.logger.error("Failed to tag techsupport thread %s: %s", thread_ts, exc)
+        raise HTTPException(status_code=500, detail="Failed to tag techsupport thread") from exc
 
 
 @app.post("/record_endorsement/", response_model=str, response_class=PlainTextResponse)
@@ -1283,6 +1502,76 @@ async def record_endorsement(
         raise HTTPException(
             status_code=500, detail=f"Internal error in record_endorsement() for session_id: {session_id}"
         ) from exc
+
+@app.get("/get_conversation_history/", response_model=str, response_class=PlainTextResponse)
+async def get_conversation_history(session_id: str, encrypted_key: str) -> str:
+    """
+    Retrieves the full conversation history for a session, formatted as one "Poster: message" line per turn.
+
+    Args:
+        session_id (str): Unique identifier for the session.
+        encrypted_key (str): JWT key for authentication (same secret as /reload_techsupport_qa_pairs/).
+
+    Returns:
+        str: The session's conversation history, e.g. "User: ...\\nAssistant: ...".
+
+    Raises:
+        HTTPException: 401 on bad JWT, 404 if the session doesn't exist, 500 on other internal errors.
+    """
+    try:
+        _require_jwt(encrypted_key)
+        llsc = get_llsc(session_id)
+        return "\n".join(f"{poster}: {message}" for poster, message, _ in llsc.conversation_history)
+    except jwt.exceptions.InvalidSignatureError as e:
+        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=f"No existing session found for session_id: {session_id}") from exc
+    except HTTPException as exc:
+        raise exc
+    except Exception as exc:
+        utils.logger.critical("Internal error in get_conversation_history() for session_id: %s. Error: %s", session_id, exc)
+        raise HTTPException(
+            status_code=500, detail=f"Internal error in get_conversation_history() for session_id: {session_id}"
+        ) from exc
+
+
+@app.post("/refine_escalation_query/", response_model=str, response_class=PlainTextResponse)
+async def refine_escalation_query_endpoint(
+    encrypted_key: str, conversation_history: str = Body(..., embed=True)
+) -> str:
+    """
+    Combines all of a user's messages in a conversation thread into a single, faithful question,
+    for use when escalating the thread to tech support. See refine_escalation_query() for details.
+
+    Args:
+        encrypted_key (str): JWT key for authentication (same secret as /reload_techsupport_qa_pairs/).
+        conversation_history (str): The full conversation history for the thread being escalated
+            (max REFINE_ESCALATION_MAX_CHARS characters).
+
+    Returns:
+        str: The refined, single question text.
+
+    Raises:
+        HTTPException: 401 on bad JWT, 413 if conversation_history is too large, 500 on internal errors.
+    """
+    try:
+        _require_jwt(encrypted_key)
+        if len(conversation_history) > REFINE_ESCALATION_MAX_CHARS:
+            raise HTTPException(
+                status_code=413,
+                detail=f"conversation_history exceeds {REFINE_ESCALATION_MAX_CHARS} characters",
+            )
+        return refine_escalation_query(conversation_history)
+    except jwt.exceptions.InvalidSignatureError as e:
+        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
+    except HTTPException as exc:
+        raise exc
+    except Exception as exc:
+        utils.logger.critical("Internal error in refine_escalation_query_endpoint(). Error: %s", exc)
+        raise HTTPException(
+            status_code=500, detail="Internal error in refine_escalation_query_endpoint()"
+        ) from exc
+
 
 @app.post("/get_golden_qa_pairs/")
 async def get_golden_qa_pairs(product: str, encrypted_key: str) -> FileResponse:

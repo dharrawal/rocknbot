@@ -3,6 +3,7 @@
 import logging
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from time import time_ns
 from typing import Optional
 
@@ -10,7 +11,11 @@ from dotenv import dotenv_values
 
 logger = logging.getLogger("RL_Logger")
 
-LILLISA_SERVER_ENV_DICT = {**dotenv_values("./env/lillisa_server.env")}
+# Anchored to this file, not the cwd: the cron/ jobs import src.utils from
+# their own working directory.
+LILLISA_SERVER_ENV_PATH = Path(__file__).resolve().parent.parent / "env" / "lillisa_server.env"
+
+LILLISA_SERVER_ENV_DICT = {**dotenv_values(str(LILLISA_SERVER_ENV_PATH))}
 # load config params from override folder
 if areofp := LILLISA_SERVER_ENV_DICT.get("LILLISA_SERVER_ENV_OVERRIDE_FILEPATH", None):
     # if the folder exists and contains a file called lillisa_server.env, load it using dotenv
@@ -24,6 +29,115 @@ LILLISA_SERVER_ENV_DICT = {
     **LILLISA_SERVER_ENV_DICT,
     **os.environ,  # override loaded values with environment variables
 }
+
+
+NO_ANSWER_MARKER = "[[NO_ANSWER]]"
+# Tables in qa_system_prompt.txt are already rule 10. Injected version
+# instructions must not reuse that number (pr42-mp.1.2).
+QA_VERSION_RULE_NUMBER = 11
+
+
+def append_product_version_rule(
+    qa_system_prompt: str, matched_versions: Optional[list] = None
+) -> str:
+    """Append the product-version instruction as rule 11 (not a second rule 10).
+
+    When matched_versions is non-empty, name those versions. Otherwise tell
+    the model all versions were used, and keep [[NO_ANSWER]] first if used.
+    """
+    if matched_versions:
+        versions = " and ".join(matched_versions)
+        return (
+            qa_system_prompt
+            + f"\n{QA_VERSION_RULE_NUMBER}. Mention the product version(s) you used "
+            f"to craft your response were '{versions}'"
+        )
+    return (
+        qa_system_prompt
+        + f"\n{QA_VERSION_RULE_NUMBER}. Mention that because a specific product version "
+        "was not specified, information from all available versions was used. If your "
+        f'response begins with the "{NO_ANSWER_MARKER}" marker per rule 9, that marker '
+        "must still come first, before this mention."
+    )
+
+
+def parse_leading_no_answer_marker(
+    llm_response: str, marker: str = NO_ANSWER_MARKER
+) -> tuple[bool, str]:
+    """Treat as no-answer only if `marker` starts the response (after leading whitespace).
+
+    The QA prompt requires the marker first, then the user-facing text. A later
+    occurrence (quoted instructions, a fenced example, echoed retrieved text)
+    is not a no-answer signal and must stay in the body.
+
+    Returns (answer_found, text_for_user). When no-answer, the leading marker
+    and following whitespace are stripped. Leading whitespace on a real answer
+    is left unchanged.
+    """
+    stripped = llm_response.lstrip()
+    if stripped.startswith(marker):
+        return False, stripped[len(marker) :].lstrip()
+    return True, llm_response
+
+
+# Same-prompt retry after a leading [[NO_ANSWER]] when the top rerank score is
+# above this value. The retry's answer is served; build_no_answer_retry_log_record
+# captures each occurrence so pr42-enhancements.2 can check whether try-2 is
+# actually grounded in that high-scoring chunk.
+NO_ANSWER_RETRY_SCORE_THRESHOLD = 3.0
+
+
+def build_no_answer_retry_log_record(
+    *,
+    product: str,
+    original_query: str,
+    generated_query: str,
+    top_rerank_score: float,
+    threshold: float,
+    top_chunk_text: str,
+    top_chunk_metadata: dict,
+    first_response: str,
+    retry_response: str,
+    first_answer_found: bool,
+    retry_answer_found: bool,
+) -> dict:
+    """Full retry payload for DEBUG (`NO_ANSWER_RETRY_DETAIL`).
+
+    Queries, both raw completions, and the top chunk are PII-ish — do not log
+    this dict at INFO. `changed_outcome` is true when try-1 was no-answer and
+    try-2 is not. pr42-enhancements.2 should extract DEBUG detail lines (or
+    enable DEBUG for a measurement window).
+    """
+    return {
+        "event": "NO_ANSWER_RETRY",
+        "product": product,
+        "original_query": original_query,
+        "generated_query": generated_query,
+        "top_rerank_score": top_rerank_score,
+        "threshold": threshold,
+        "top_chunk_text": top_chunk_text,
+        "top_chunk_metadata": top_chunk_metadata,
+        "first_response": first_response,
+        "retry_response": retry_response,
+        "first_answer_found": first_answer_found,
+        "retry_answer_found": retry_answer_found,
+        "changed_outcome": (not first_answer_found) and retry_answer_found,
+    }
+
+
+def build_no_answer_retry_info_record(detail: dict) -> dict:
+    """INFO subset: enough for ops to see a retry ran, no question/answer text."""
+    return {
+        "event": "NO_ANSWER_RETRY",
+        "product": detail["product"],
+        "top_rerank_score": detail["top_rerank_score"],
+        "threshold": detail["threshold"],
+        "first_answer_found": detail["first_answer_found"],
+        "retry_answer_found": detail["retry_answer_found"],
+        "changed_outcome": detail["changed_outcome"],
+        "query_chars": len(detail.get("original_query") or ""),
+        "retry_chars": len(detail.get("retry_response") or ""),
+    }
 
 
 def get_env_variable(var_name: str, default: Optional[str] = None) -> str:
