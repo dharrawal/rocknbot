@@ -8,10 +8,11 @@ Slack
 
 import asyncio
 import os
+import re
 import time
 import jwt
 
-from typing import Dict, List, Any
+from typing import Dict, Iterable, List, Any, Optional, Set, Tuple
 import json
 
 import requests
@@ -472,13 +473,75 @@ async def conversations_replies_with_retry(channel: str, ts: str):
     raise last_exc
 
 
+# Leftmost Slack addressee. Channel links (<#C...>) are references, not addressees.
+# User-group and broadcast mentions address someone other than the bot.
+_SLACK_ADDRESSEE_RE = re.compile(
+    r"<@(?P<user>[UW][A-Z0-9]+)(?:\|[^>]*)?>"
+    r"|<!subteam\^(?P<subteam>[A-Z0-9]+)(?:\|[^>]*)?>"
+    r"|<!(?P<broadcast>channel|here|everyone)(?:\|[^>]*)?>"
+)
+
+
+def first_slack_addressee(text: str) -> Optional[Tuple[str, str]]:
+    """Return the leftmost Slack addressee in a post.
+
+    ("user", user_id) for an @user mention. ("other", token) for an @usergroup,
+    @channel, @here, or @everyone mention. None when the post names nobody.
+    """
+    match = _SLACK_ADDRESSEE_RE.search(text or "")
+    if match is None:
+        return None
+    if match.group("user"):
+        return ("user", match.group("user"))
+    if match.group("subteam"):
+        return ("other", match.group("subteam"))
+    return ("other", match.group("broadcast"))
+
+
+def addressee_decision(text: str, bot_user_id: str) -> Optional[bool]:
+    """Whether the first Slack addressee is the bot.
+
+    True: answer. False: stay silent. None: the post has no Slack addressee,
+    so the caller decides from who else has posted in the thread.
+    """
+    found = first_slack_addressee(text)
+    if found is None:
+        return None
+    kind, value = found
+    return kind == "user" and value == bot_user_id
+
+
+def unaddressed_thread_is_for_bot(
+    participant_ids: Iterable[str], author_id: str, bot_user_ids: Iterable[str]
+) -> bool:
+    """An unaddressed post is for the bot when no other human has posted.
+
+    The author and the bot are the only allowed posters. An empty participant
+    set (a brand-new thread, or a replies fetch that failed) is for the bot.
+    """
+    bots = set(bot_user_ids)
+    for user_id in participant_ids:
+        if user_id != author_id and user_id not in bots:
+            return False
+    return True
+
+
+def _known_bot_user_ids() -> Set[str]:
+    """User ids that count as the bot when scanning who has posted in a thread."""
+    ids = {LIL_LISA_SLACK_USERID}
+    if BOT_USER_ID:
+        ids.add(BOT_USER_ID)
+    return ids
+
+
 @app.event("message")
 async def handle_message_events(event, say):
     """
     Handles Slack message events.
 
-    This asynchronous function is an event handler for Slack "message" events. It processes the event based on
-    the amount of people in a specific thread or whether the bot was tagged with an '@'.
+    Answers when the first Slack addressee is the bot. Stays silent when the first
+    addressee is anyone else. With no addressee, answers only when every other poster
+    in the thread is the bot (including a new thread where nobody else has posted).
 
     Args:
         event (dict): The Slack message event object.
@@ -492,38 +555,62 @@ async def handle_message_events(event, say):
 
     # Once a thread has been escalated to techsupport, the conversation has moved there --
     # stay completely silent on any further activity in the original thread (no LLM call,
-    # no post). Checked here, before the conversations_replies fetch below (which exists only
-    # to count participants for the "should we respond" decision), so an escalated thread
+    # no post). Checked here, before any conversations_replies fetch (which exists only
+    # to see who has posted, for the "should we respond" decision), so an escalated thread
     # costs nothing beyond this dict lookup.
     if is_escalation_active(conv_id):
         logger.info(f"[ESCALATED SILENCE] Thread {conv_id} already escalated to techsupport, staying silent.")
         return
 
-    logger.info(f"[DEBUG conversations_replies] channel_id={channel_id!r} conv_id={conv_id!r}")
-    participants = set()
-    try:
-        replies = await conversations_replies_with_retry(channel=channel_id, ts=conv_id)
-        for message in replies.data["messages"]:
-            participants.add(message["user"])
-            if len(participants) >= 3:
-                break
-    except Exception as exc:  # pylint: disable=broad-except
-        # Participant count is only used for the "should we respond" heuristic below --
-        # fail safe by assuming a low count (i.e. still respond) rather than crashing the
-        # whole handler when Slack can't be reached for this.
-        logger.error(f"[PARTICIPANT COUNT FALLBACK] conversations_replies failed for channel={channel_id!r} conv_id={conv_id!r}: {exc}")
-        participants = set()
-
     # The techsupport channel is for human discussion: only respond when directly mentioned,
-    # never based on participant count.
+    # never based on who has posted. A mention gets the redirect, not a product answer.
     if TECHSUPPORT_CHANNEL_ID and channel_id == TECHSUPPORT_CHANNEL_ID:
         if LIL_LISA_SLACK_USERID in event.get("text", ""):
             thread_ts = event.get("thread_ts") or event.get("ts")
             await say(text=TS_CHANNEL_MENTION_REPLY, thread_ts=thread_ts)
         return
 
-    # Process message if bot was mentioned OR thread has < 3 participants
-    if LIL_LISA_SLACK_USERID in event["text"] or len(participants) < 3:
+    text = event.get("text")
+    author_id = event.get("user")
+    if text is None or not author_id:
+        logger.info(
+            f"[REPLY DECISION] channel={channel_id!r} conv_id={conv_id!r} answer=False "
+            f"reason=missing text or user"
+        )
+        return
+
+    decision = addressee_decision(text, LIL_LISA_SLACK_USERID)
+    if decision is None:
+        # No Slack addressee. Look at who else has posted. Fail safe by assuming no other
+        # human (i.e. still respond) rather than crashing the handler when Slack can't be
+        # reached for this.
+        logger.info(f"[DEBUG conversations_replies] channel_id={channel_id!r} conv_id={conv_id!r}")
+        participants: Set[str] = set()
+        bot_ids = _known_bot_user_ids()
+        try:
+            replies = await conversations_replies_with_retry(channel=channel_id, ts=conv_id)
+            for message in replies.data["messages"]:
+                user_id = message.get("user")
+                if not user_id:
+                    continue
+                participants.add(user_id)
+                if user_id != author_id and user_id not in bot_ids:
+                    break
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error(
+                f"[PARTICIPANT COUNT FALLBACK] conversations_replies failed for "
+                f"channel={channel_id!r} conv_id={conv_id!r}: {exc}"
+            )
+            participants = set()
+        decision = unaddressed_thread_is_for_bot(participants, author_id, bot_ids)
+        reason = "no addressee; no other human has posted" if decision else "no addressee; another human has posted"
+    else:
+        reason = "first addressee is the bot" if decision else "first addressee is someone else"
+
+    logger.info(
+        f"[REPLY DECISION] channel={channel_id!r} conv_id={conv_id!r} answer={decision} reason={reason}"
+    )
+    if decision:
         await process_msg(event, say)
 
 
