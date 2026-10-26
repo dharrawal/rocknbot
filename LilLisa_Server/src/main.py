@@ -69,6 +69,7 @@ from src.agent_and_tools import (
 )
 from src import golden_qa_sync
 from src.embedding_config import VoyageEmbedding, VOYAGE_EMBEDDING_DIMENSION
+from src.followup_classifier import build_retrieval_args
 from src.lillisa_server_context import LOCALE, LilLisaServerContext
 from src.llama_index_lancedb_vector_store import LanceDBVectorStore
 from src.llama_index_markdown_reader import MarkdownReader
@@ -778,11 +779,14 @@ async def invoke_stream_with_nodes(
     def _run_pipeline():
         """Run the deterministic retrieval pipeline in a background thread."""
         t0 = time.perf_counter()
-        conversation_history = "\n".join(f"{poster}: {message}" for poster, message, _ in llsc.conversation_history)
-        # Conditionally improve query if there is prior conversation context
-        improved_query = ""
-        if len(llsc.conversation_history) > 1 and conversation_history.strip():
-            improved_query = improve_query(nl_query, conversation_history)
+        # A later turn in the same web session is the follow-up signal. When
+        # a Jev key file is configured, that signal is checked before any rewrite.
+        improved_query, conversation_history = build_retrieval_args(
+            nl_query,
+            llsc.conversation_history,
+            may_rewrite=len(llsc.conversation_history) > 1,
+            improve_query=improve_query,
+        )
         result = answer_from_document_retrieval(
             product=product,
             original_query=nl_query,
@@ -964,16 +968,17 @@ def invoke(
                 "query_id": query_id
             },headers=custom_headers)
 
-        # Deterministic pipeline: conditionally improve query, then retrieve
-        conversation_history = "\n".join(f"{poster}: {message}" for poster, message, _ in llsc.conversation_history)
-
+        # Deterministic pipeline: conditionally improve query, then retrieve.
+        # is_followup is the caller's signal (Slack sets it for any in-thread
+        # post). When a Jev key file is configured, a self-contained question skips the
+        # rewrite and the prior turns stay out of the answer prompt.
         t0_pipeline = time.perf_counter()
-        # Step 1: Improve query if this is a follow-up with existing conversation context
-        improved_query = ""
-        if is_followup and conversation_history.strip():
-            t0_improve = time.perf_counter()
-            improved_query = improve_query(nl_query, conversation_history)
-            utils.logger.debug("PERF | invoke_improve_query | %.3fs", time.perf_counter() - t0_improve)
+        improved_query, conversation_history = build_retrieval_args(
+            nl_query,
+            llsc.conversation_history,
+            may_rewrite=is_followup,
+            improve_query=improve_query,
+        )
 
         # Step 2: Retrieve documents and synthesize answer
         t0_retrieval = time.perf_counter()
