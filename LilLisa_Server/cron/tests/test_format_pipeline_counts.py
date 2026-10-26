@@ -12,7 +12,7 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from pipeline_summary import format_pipeline_counts  # noqa: E402
+from pipeline_summary import format_pipeline_counts, format_pipeline_error_alert  # noqa: E402
 
 
 class FormatPipelineCountsTests(unittest.TestCase):
@@ -94,6 +94,95 @@ class FormatPipelineCountsTests(unittest.TestCase):
         rendered = format_pipeline_counts(counts)
         self.assertTrue(rendered.endswith("alpha_new=8 zeta_new=9"))
         self.assertLess(rendered.index("errored=0"), rendered.index("alpha_new=8"))
+
+
+class FormatPipelineErrorAlertTests(unittest.TestCase):
+    """pr42-ujb: the admin alert headline and parenthetical count the same failures."""
+
+    def _techsupport_counts(self, **overrides):
+        counts = {
+            "checked": 0,
+            "added": 0,
+            "enriched": 0,
+            "replaced": 0,
+            "left_as_is_not_useful": 0,
+            "left_as_is_not_conclusive": 0,
+            "skipped_not_useful": 0,
+            "skipped_not_conclusive": 0,
+            "errored": 0,
+        }
+        counts.update(overrides)
+        return counts
+
+    def _product_counts(self, **overrides):
+        counts = {
+            "checked": 0,
+            "corrected": 0,
+            "added": 0,
+            "replaced": 0,
+            "skipped_no_expert_reply": 0,
+            "skipped_no_expert_insight": 0,
+            "errored": 0,
+        }
+        counts.update(overrides)
+        return counts
+
+    def test_two_unresolved_expert_groups_are_channel_failures(self):
+        # The reported admin-channel line: both products fail before any thread
+        # is scanned, so the headline used to say "2 thread(s) errored out of 0
+        # checked" while the parenthetical, built from the techsupport loop
+        # alone, said errored=0.
+        errors = [
+            {"thread_ts": "channel C07E5K0UD53", "error": "[IDA] missing_scope"},
+            {"thread_ts": "channel C07EXE7D116", "error": "[IDDM] missing_scope"},
+        ]
+        text = format_pipeline_error_alert(
+            "nightly_pipeline.py",
+            errors,
+            self._techsupport_counts(),
+            self._product_counts(errored=2),
+        )
+        self.assertTrue(text.startswith("nightly_pipeline.py: 2 product channel(s) failed ("))
+        self.assertIn("errored=2", text)
+        self.assertNotIn("errored=0", text)
+        self.assertNotIn("thread(s)", text)
+        self.assertIn("- channel C07E5K0UD53: [IDA] missing_scope", text)
+        self.assertIn("- channel C07EXE7D116: [IDDM] missing_scope", text)
+        # Zero product-only keys stay out; the techsupport parenthetical stays.
+        self.assertNotIn("corrected=", text)
+        self.assertIn("enriched=0", text)
+        self.assertNotIn("checked=", text.split("\n", 1)[0])
+
+    def test_thread_errors_keep_the_thread_wording(self):
+        text = format_pipeline_error_alert(
+            "nightly_pipeline.py",
+            [{"thread_ts": "100.0", "error": "lancedb down"}],
+            self._techsupport_counts(checked=4, errored=1),
+            self._product_counts(),
+        )
+        self.assertIn("1 thread(s) errored out of 4 checked", text)
+        self.assertNotIn("product channel", text)
+        self.assertIn("errored=1", text)
+        self.assertNotIn("corrected=", text)
+
+    def test_thread_and_channel_failures_are_both_in_the_total(self):
+        errors = [
+            {"thread_ts": "100.0", "error": "lancedb down"},
+            {"thread_ts": "channel C_IDA", "error": "[IDA] missing_scope"},
+            {"thread_ts": "channel C_IDDM", "error": "[IDDM] missing_scope"},
+        ]
+        text = format_pipeline_error_alert(
+            "nightly_pipeline.py",
+            errors,
+            self._techsupport_counts(checked=4, errored=1),
+            self._product_counts(errored=2, corrected=2),
+        )
+        self.assertIn(
+            "1 thread(s) errored out of 4 checked; 2 product channel(s) failed",
+            text,
+        )
+        self.assertIn("errored=3", text)
+        self.assertIn("corrected=2", text)
 
 
 if __name__ == "__main__":

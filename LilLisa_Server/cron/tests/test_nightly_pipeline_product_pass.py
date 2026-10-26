@@ -724,7 +724,74 @@ class RunProductChannelScanTests(ProductPassTestBase):
         self.assertIn("lancedb down", summary["errors"][0]["error"])
         alert_text = self.mocks["alert"].call_args[0][2]
         self.assertIn("product-channel scan", alert_text)
+        self.assertIn("1 thread(s) errored out of 1 checked", alert_text)
+        self.assertIn("errored=1", alert_text)
         self.assertIn("lancedb down", alert_text)
+
+    def test_unresolvable_expert_group_is_alerted_as_a_channel_failure(self):
+        self.channels = {"IDA": "C07E5K0UD53", "IDDM": "C07EXE7D116"}
+        self.expert_error = pipeline.expert_group.ExpertLookupError(
+            "IDA", "@rocknbot-certified-ida-experts", RuntimeError("missing_scope")
+        )
+        with self.assertLogs(pipeline.logger, level="ERROR"):
+            self.run_scan()
+        alert_text = self.mocks["alert"].call_args[0][2]
+        self.assertIn("2 product channel(s) failed", alert_text)
+        self.assertIn("errored=2", alert_text)
+        self.assertNotIn("thread(s) errored", alert_text)
+        self.assertIn("channel C07E5K0UD53", alert_text)
+        self.assertIn("missing_scope", alert_text)
+
+
+class RunPipelineAlertTests(unittest.TestCase):
+    """pr42-ujb: the nightly alert must count product-channel failures in both halves."""
+
+    def test_unresolved_expert_groups_match_in_headline_and_parenthetical(self):
+        def product_pass(_token, *, slack_env=None, errors=None, force=False):
+            errors.append({"thread_ts": "channel C07E5K0UD53", "error": "[IDA] missing_scope"})
+            errors.append({"thread_ts": "channel C07EXE7D116", "error": "[IDDM] missing_scope"})
+            totals = pipeline.new_product_counts()
+            totals["errored"] = 2
+            return {"enabled": True, "products": {}, "totals": totals}
+
+        alert = MagicMock()
+        with (
+            patch.object(
+                pipeline,
+                "load_env",
+                return_value={
+                    "SLACK_BOT_TOKEN": "t",
+                    "TECHSUPPORT_CHANNEL_ID": "C_TECH",
+                    "ADMIN_CHANNEL_ID": "C_ADMIN",
+                },
+            ),
+            patch.object(pipeline, "load_state", return_value={}),
+            patch.object(pipeline, "channel_state", return_value={"threads": {}, "last_run_timestamp": "0"}),
+            patch.object(pipeline, "is_channel_check_due", return_value=False),
+            patch.object(pipeline, "run_product_channel_pass", side_effect=product_pass),
+            patch.object(
+                pipeline,
+                "publish_changes_if_any",
+                return_value={
+                    "github_push": {"pushed": False},
+                    "techsupport_index_reload_after_ingest": {"reloaded": False},
+                },
+            ),
+            patch.object(pipeline, "sync_edited_entries", return_value={}),
+            patch.object(pipeline, "run_reembed_if_due", return_value={"ran": False}),
+            patch.object(pipeline, "post_admin_alert", alert),
+        ):
+            summary = pipeline.run_pipeline()
+
+        self.assertEqual(summary["errored"], 0)
+        self.assertEqual(summary["product_channels"]["totals"]["errored"], 2)
+        alert_text = alert.call_args[0][2]
+        self.assertTrue(alert_text.startswith("nightly_pipeline.py: 2 product channel(s) failed ("))
+        self.assertIn("errored=2", alert_text)
+        self.assertNotIn("errored=0", alert_text)
+        self.assertNotIn("thread(s)", alert_text)
+        self.assertIn("- channel C07E5K0UD53: [IDA] missing_scope", alert_text)
+        self.assertIn("- channel C07EXE7D116: [IDDM] missing_scope", alert_text)
 
 
 if __name__ == "__main__":

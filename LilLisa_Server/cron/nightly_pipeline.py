@@ -17,10 +17,12 @@ built in earlier steps:
 
 Each thread is processed independently (its own try/except) so one bad
 thread can't take down the whole run. A per-run summary is logged, and if
-any thread errored, the error details are posted to the shared admin Slack
-channel (ADMIN_CHANNEL_ID in cron/env/techsupport_sync.env -- reuses the
-same channel lil-lisa's ADMIN_CHANNEL_ID_IDA/ADMIN_CHANNEL_ID_IDDM already
-point at).
+any thread or product channel errored, the error details are posted to the
+shared admin Slack channel (ADMIN_CHANNEL_ID in cron/env/techsupport_sync.env
+-- reuses the same channel lil-lisa's ADMIN_CHANNEL_ID_IDA/ADMIN_CHANNEL_ID_IDDM
+already point at). The alert's headline and parenthetical count the same
+failures: a product whose expert group cannot be resolved is a channel
+failure, not a thread errored out of zero checked.
 
 How often step 1 actually checks the Slack channel is itself interval-gated
 by TECHSUPPORT_SYNC_INTERVAL_HOURS (env/lillisa_server.env, default 24, i.e.
@@ -150,7 +152,11 @@ from nightly_techsupport_sync import (  # noqa: E402
     save_state,
     sync,
 )
-from pipeline_summary import format_pipeline_counts  # noqa: E402
+from pipeline_summary import (  # noqa: E402
+    CHANNEL_ERROR_PREFIX,
+    format_pipeline_counts,
+    format_pipeline_error_alert,
+)
 from techsupport_classifier import (  # noqa: E402
     classify_thread,
     format_thread_messages,
@@ -694,7 +700,7 @@ def run_product_channel_pass(
             expert_ids = expert_group.expert_user_ids(product)
         except (ValueError, expert_group.ExpertLookupError) as exc:
             counts["errored"] += 1
-            errors.append({"thread_ts": f"channel {channel_id}", "error": f"[{product}] {exc}"})
+            errors.append({"thread_ts": f"{CHANNEL_ERROR_PREFIX}{channel_id}", "error": f"[{product}] {exc}"})
             logger.exception("Could not resolve experts for %s (channel %s)", product, channel_id)
             continue
 
@@ -885,11 +891,10 @@ def run_product_channel_scan(force: bool = False) -> Dict[str, Any]:
         logger.info("Product-channel scan summary: %s", format_pipeline_counts(product_totals))
 
     if errors:
-        error_lines = "\n".join(f"- {e['thread_ts']}: {e['error']}" for e in errors)
-        alert_text = (
-            f"nightly_pipeline.py (product-channel scan): {int(product_totals.get('errored', 0))} thread(s) "
-            f"errored out of {int(product_totals.get('checked', 0))} checked "
-            f"({format_pipeline_counts(product_totals, omit=('checked',))}).\n{error_lines}"
+        alert_text = format_pipeline_error_alert(
+            "nightly_pipeline.py (product-channel scan)",
+            errors,
+            product_totals,
         )
         post_admin_alert(token, admin_channel_id, alert_text)
 
@@ -1050,14 +1055,14 @@ def run_pipeline(force: bool = False) -> Dict[str, Any]:
         logger.info("Product-channel summary: %s", format_pipeline_counts(product_totals))
 
     if errors:
-        error_lines = "\n".join(f"- {e['thread_ts']}: {e['error']}" for e in errors)
-        # Product-channel threads share this alert, so count both loops.
-        total_errored = counts["errored"] + int(product_totals.get("errored", 0))
-        total_checked = counts["checked"] + int(product_totals.get("checked", 0))
-        # `checked` is already in the sentence; omit it from the parenthetical.
-        alert_text = (
-            f"nightly_pipeline.py: {total_errored} thread(s) errored out of {total_checked} checked "
-            f"({format_pipeline_counts(counts, omit=('checked',))}).\n{error_lines}"
+        # Both loops share this alert. The headline and the parenthetical count
+        # the same failures: techsupport thread errors plus product-channel
+        # errors, with an unresolved expert group called a channel failure.
+        alert_text = format_pipeline_error_alert(
+            "nightly_pipeline.py",
+            errors,
+            counts,
+            product_totals,
         )
         post_admin_alert(token, admin_channel_id, alert_text)
 
