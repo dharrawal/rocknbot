@@ -55,21 +55,12 @@ class PreflightTestCase(unittest.TestCase):
         self.cron.mkdir()
         self.missing_dir = self.root / "no_env_files_here"
         self._locked = []
-        self.sync = {
-            "SLACK_BOT_TOKEN": "xoxb-valid",
-            "TECHSUPPORT_CHANNEL_ID": "C_TS",
-            "CHANNEL_ID_IDA": "C_IDA",
-            "CHANNEL_ID_IDDM": "C_IDDM",
-            "EXPERT_GROUP_ID_IDA": "S_IDA",
-            "EXPERT_GROUP_ID_IDDM": "S_IDDM",
-        }
         self.github = {
             "GITHUB_TOKEN": "ghp_valid",
             "GITHUB_REPO_URL": "https://github.com/org/repo.git",
         }
         self.lillisa = {
             "AUTHENTICATION_KEY": "auth",
-            "LIL_LISA_SERVER_URL": "http://127.0.0.1:8000",
             "LANCEDB_FOLDERPATH": "./lancedb",
             "TECHSUPPORT_SCAN_PRODUCT_CHANNELS": "true",
         }
@@ -89,10 +80,8 @@ class PreflightTestCase(unittest.TestCase):
     def run_preflight(self, **overrides) -> "preflight.PreflightResult":
         kwargs = dict(
             environ=self.environ,
-            sync_env=self.sync,
             github_env=self.github,
             lillisa_env=self.lillisa,
-            sync_env_path=self.root / "cron" / "env" / "techsupport_sync.env",
             github_env_path=self.root / "cron" / "env" / "github_push.env",
             lillisa_env_path=self.root / "env" / "lillisa_server.env",
             # LANCEDB_FOLDERPATH=./lancedb resolves against this, so the state
@@ -136,13 +125,11 @@ class BlockingKeyTests(PreflightTestCase):
     # deliberately absent: the scan runs after the techsupport ingest loop and
     # its failures are caught per product, so those are DEGRADED. See
     # _check_product_scan()'s docstring and ProductScanTests.
-    SYNC_KEYS = (
-        "SLACK_BOT_TOKEN",
-        "TECHSUPPORT_CHANNEL_ID",
-    )
 
     def test_each_blocking_key_missing_individually(self):
-        cases = [("sync", key) for key in self.SYNC_KEYS] + [
+        cases = [
+            ("github", "GITHUB_TOKEN"),
+            ("github", "GITHUB_REPO_URL"),
             ("lillisa", "AUTHENTICATION_KEY"),
             ("lillisa", "LANCEDB_FOLDERPATH"),
         ]
@@ -155,42 +142,41 @@ class BlockingKeyTests(PreflightTestCase):
                 self.assertIs(result.problems[0].severity, Severity.BLOCKING)
 
     def test_several_missing_are_all_reported(self):
-        for key in ("SLACK_BOT_TOKEN", "TECHSUPPORT_CHANNEL_ID", "EXPERT_GROUP_ID_IDA"):
-            self.sync.pop(key)
+        self.github.pop("GITHUB_TOKEN")
+        self.github.pop("GITHUB_REPO_URL")
         self.lillisa.pop("AUTHENTICATION_KEY")
         result = self.run_preflight()
         self.assertEqual(
             self.keys_by_severity(result, Severity.BLOCKING),
-            {"SLACK_BOT_TOKEN", "TECHSUPPORT_CHANNEL_ID", "AUTHENTICATION_KEY"},
+            {"GITHUB_TOKEN", "GITHUB_REPO_URL", "AUTHENTICATION_KEY"},
         )
         # The report carries every problem regardless of tier, so one rollout
         # fixes all of them -- including the DEGRADED expert group.
         report = preflight.format_preflight_report(result, strict=True)
-        for key in ("SLACK_BOT_TOKEN", "TECHSUPPORT_CHANNEL_ID", "EXPERT_GROUP_ID_IDA", "AUTHENTICATION_KEY"):
+        for key in ("GITHUB_TOKEN", "GITHUB_REPO_URL", "AUTHENTICATION_KEY"):
             self.assertIn(key, report)
         # BLOCKING is listed first and numbered contiguously, so an operator
         # reads what stops the boot before what merely degrades it.
         for number in range(1, 4):
             self.assertIn(f"  {number}. [BLOCKING]", report)
-        self.assertIn("  4. [DEGRADED]", report)
-        self.assertIn("4 problems: 3 blocking, 1 degraded", report)
+        self.assertIn("3 problems: 3 blocking, 0 degraded", report)
 
     def test_empty_and_whitespace_values_count_as_missing(self):
-        self.sync["SLACK_BOT_TOKEN"] = ""
-        self.sync["TECHSUPPORT_CHANNEL_ID"] = "   \t"
+        self.github["GITHUB_TOKEN"] = ""
+        self.github["GITHUB_REPO_URL"] = "   \t"
         self.lillisa["AUTHENTICATION_KEY"] = " "
         result = self.run_preflight()
         self.assertEqual(
             self.keys_by_severity(result, Severity.BLOCKING),
-            {"SLACK_BOT_TOKEN", "TECHSUPPORT_CHANNEL_ID", "AUTHENTICATION_KEY"},
+            {"GITHUB_TOKEN", "GITHUB_REPO_URL", "AUTHENTICATION_KEY"},
         )
 
     def test_staging_incident_no_env_files_mounted(self):
         # The real failure: no cron/env/*.env mounted, nothing injected.
-        result = self.run_preflight(sync_env=None, github_env=None)
+        result = self.run_preflight(github_env=None)
         self.assertFalse(result.ok)
         self.assertTrue(
-            {"SLACK_BOT_TOKEN", "TECHSUPPORT_CHANNEL_ID"} <= self.keys_by_severity(result, Severity.BLOCKING)
+            {"GITHUB_TOKEN", "GITHUB_REPO_URL"} <= self.keys_by_severity(result, Severity.BLOCKING)
         )
 
 
@@ -198,33 +184,30 @@ class ResolutionTests(PreflightTestCase):
     def test_values_only_in_environ_with_env_files_absent(self):
         # Documented injection route: no .env files at all, everything in the
         # container environment.
-        self.environ = {**self.sync, **self.github, **self.lillisa}
+        self.environ = {**self.github, **self.lillisa}
         result = self.run_preflight(
-            sync_env=None,
             github_env=None,
             lillisa_env=None,
-            sync_env_path=self.missing_dir / "techsupport_sync.env",
             github_env_path=self.missing_dir / "github_push.env",
             lillisa_env_path=self.missing_dir / "lillisa_server.env",
         )
         self.assertEqual(result.problems, ())
 
     def test_environ_overrides_blank_file_value(self):
-        self.sync["SLACK_BOT_TOKEN"] = ""
-        self.environ = {"SLACK_BOT_TOKEN": "xoxb-from-env"}
+        self.github["GITHUB_TOKEN"] = ""
+        self.environ = {"GITHUB_TOKEN": "ghp-from-env"}
         self.assertEqual(self.run_preflight().problems, ())
 
     @unittest.skipIf(REAL_DOTENV_VALUES is None, "python-dotenv not installed")
     def test_reads_real_env_file_from_disk(self):
-        env_path = self.root / "cron" / "env" / "techsupport_sync.env"
+        env_path = self.root / "cron" / "env" / "github_push.env"
         env_path.parent.mkdir(parents=True)
-        env_path.write_text("".join(f"{k}={v}\n" for k, v in self.sync.items()), encoding="utf-8")
+        env_path.write_text("".join(f"{k}={v}\n" for k, v in self.github.items()), encoding="utf-8")
         with patch.object(preflight, "dotenv_values", REAL_DOTENV_VALUES):
-            result = self.run_preflight(sync_env=None, sync_env_path=env_path)
+            result = self.run_preflight(github_env=None, github_env_path=env_path)
         self.assertEqual(result.problems, ())
 
     def test_default_paths_point_at_cron_env_files(self):
-        self.assertEqual(preflight.SYNC_ENV_PATH, preflight.PACKAGE_ROOT / "env" / "techsupport_sync.env")
         self.assertEqual(preflight.GITHUB_ENV_PATH, preflight.PACKAGE_ROOT / "env" / "github_push.env")
 
 
@@ -250,103 +233,6 @@ class GithubTests(PreflightTestCase):
         self.assertFalse(result.ok)
         self.assertEqual(self.keys_by_severity(result, Severity.BLOCKING), {"GITHUB_TOKEN", "GITHUB_REPO_URL"})
         self.assertEqual(result.degraded, ())
-
-    def test_absent_server_url_is_degraded(self):
-        self.lillisa.pop("LIL_LISA_SERVER_URL")
-        result = self.run_preflight()
-        self.assertTrue(result.ok)
-        self.assertEqual(self.keys_by_severity(result, Severity.DEGRADED), {"LIL_LISA_SERVER_URL"})
-        self.assertIn("127.0.0.1", self.find(result, "LIL_LISA_SERVER_URL").problem)
-
-    def test_degraded_only_report_uses_degraded_code_and_starts(self):
-        self.lillisa.pop("LIL_LISA_SERVER_URL")
-        report = preflight.format_preflight_report(self.run_preflight(), strict=True)
-        self.assertIn(preflight.DEGRADED_CODE, report)
-        self.assertNotIn(preflight.FAILURE_CODE, report)
-        self.assertNotIn("Refusing to start", report)
-
-
-class ProductScanTests(PreflightTestCase):
-    # Every product-channel-scan key is DEGRADED -- see _check_product_scan()'s
-    # docstring. The pass runs after the techsupport ingest loop has already
-    # completed and its per-product failures are caught, so none of these keys
-    # may ever refuse startup. That matters because the scan defaults to ON:
-    # promoting any of them would silently make four extra keys mandatory for
-    # every deployment.
-    SCAN_KEYS = {"CHANNEL_ID_IDA", "CHANNEL_ID_IDDM", "EXPERT_GROUP_ID_IDA", "EXPERT_GROUP_ID_IDDM"}
-
-    def _strip_scan_keys(self):
-        for key in self.SCAN_KEYS:
-            self.sync.pop(key)
-
-    def test_reported_but_never_blocking_when_scan_enabled(self):
-        self._strip_scan_keys()
-        result = self.run_preflight()
-        self.assertEqual(result.blocking, ())
-        self.assertEqual(self.keys_by_severity(result, Severity.DEGRADED), self.SCAN_KEYS)
-
-    def test_missing_product_channel_alone_still_starts(self):
-        """Scanning only one product is a supported deployment, so a missing
-        channel id must stay out of the blocking tier entirely."""
-        channel_keys = {"CHANNEL_ID_IDA", "CHANNEL_ID_IDDM"}
-        for key in channel_keys:
-            self.sync.pop(key)
-        result = self.run_preflight()
-        self.assertTrue(result.ok)
-        self.assertEqual(result.blocking, ())
-        self.assertEqual(self.keys_by_severity(result, Severity.DEGRADED), channel_keys)
-
-    def test_unconfigured_scan_does_not_refuse_startup(self):
-        """The regression guard for the tier decision: a pod whose techsupport
-        ingest is fully configured must boot even though the on-by-default scan
-        has nothing configured at all."""
-        self._strip_scan_keys()
-        result = self.run_preflight()
-        self.assertTrue(result.ok)
-        report = preflight.format_preflight_report(result, strict=True)
-        self.assertNotIn("Refusing to start", report)
-
-    def test_scan_defaults_to_enabled(self):
-        self._strip_scan_keys()
-        self.lillisa.pop("TECHSUPPORT_SCAN_PRODUCT_CHANNELS")
-        result = self.run_preflight()
-        self.assertEqual(result.blocking, ())
-        self.assertEqual(self.keys_by_severity(result, Severity.DEGRADED), self.SCAN_KEYS)
-
-    def test_not_required_when_scan_disabled(self):
-        self._strip_scan_keys()
-        for value in ("false", "FALSE", "0", "no", "off"):
-            with self.subTest(value=value):
-                self.lillisa["TECHSUPPORT_SCAN_PRODUCT_CHANNELS"] = value
-                self.assertEqual(self.run_preflight().problems, ())
-
-    def test_scan_disabled_via_environ_overrides_file(self):
-        self._strip_scan_keys()
-        self.environ = {"TECHSUPPORT_SCAN_PRODUCT_CHANNELS": "false"}
-        self.assertEqual(self.run_preflight().problems, ())
-
-    def test_ido_keys_stay_optional(self):
-        self.sync.pop("CHANNEL_ID_IDO", None)
-        self.sync.pop("EXPERT_GROUP_ID_IDO", None)
-        self.assertEqual(self.run_preflight().problems, ())
-
-    def test_lil_lisa_env_supplies_channel_ids_when_the_sync_file_does_not(self):
-        sync_path = self.root / "cron" / "env" / "techsupport_sync.env"
-        sync_path.parent.mkdir(parents=True)
-        sync_path.write_text(
-            "SLACK_BOT_TOKEN=xoxb-valid\n"
-            "TECHSUPPORT_CHANNEL_ID=C_TS\n"
-            "EXPERT_GROUP_ID_IDA=S_IDA\n"
-            "EXPERT_GROUP_ID_IDDM=S_IDDM\n"
-        )
-        bot = self.root / "lil-lisa.env"
-        bot.write_text("CHANNEL_ID_IDA=C_IDA\nCHANNEL_ID_IDDM=C_IDDM\nSLACK_BOT_TOKEN=xoxb-bot\n")
-        with patch("paths.bot_env_path", return_value=bot), patch(
-            "techsupport_preflight.bot_env_path", return_value=bot
-        ):
-            result = self.run_preflight(sync_env=None, environ={})
-        self.assertEqual(result.problems, ())
-        self.assertIn(bot, result.sources)
 
 
 @unittest.skipIf(RUNNING_AS_ROOT, ROOT_SKIP_REASON)
@@ -464,13 +350,11 @@ class WritabilityHelperTests(unittest.TestCase):
 
 class RedactionTests(PreflightTestCase):
     def test_no_secret_values_in_report(self):
-        self.sync["SLACK_BOT_TOKEN"] = SECRET_SLACK
         self.github["GITHUB_TOKEN"] = SECRET_PAT
         self.github["GITHUB_REPO_URL"] = SECRET_URL
-        self.lillisa["AUTHENTICATION_KEY"] = SECRET_AUTH
-        self.lillisa.pop("LIL_LISA_SERVER_URL")
-        self.sync.pop("EXPERT_GROUP_ID_IDA")
-        self.environ = {"SOME_OTHER_SECRET": "env-dump-canary"}
+        self.lillisa["AUTHENTICATION_KEY"] = ""
+        self.lillisa["LANCEDB_FOLDERPATH"] = ""
+        self.environ = {"SOME_OTHER_SECRET": "env-dump-canary", "SLACK_BOT_TOKEN": SECRET_SLACK}
         result = self.run_preflight()
         self.assertGreaterEqual(len(result.problems), 3)
         for strict in (True, False):
@@ -497,26 +381,30 @@ class RedactionTests(PreflightTestCase):
 
 class ReportFormatTests(PreflightTestCase):
     def _broken(self):
-        self.sync.pop("SLACK_BOT_TOKEN")
-        self.sync.pop("TECHSUPPORT_CHANNEL_ID")
         self.github = {}
-        self.lillisa.pop("LIL_LISA_SERVER_URL")
+        self.lillisa.pop("AUTHENTICATION_KEY")
         return self.run_preflight()
 
     def test_report_contents(self):
         result = self._broken()
         report = preflight.format_preflight_report(result, strict=True)
         self.assertTrue(report.startswith(f"{preflight.FAILURE_CODE}:"))
-        self.assertIn("5 problems", report)
+        self.assertIn("3 problems", report)
         self.assertIn("[BLOCKING]", report)
-        self.assertIn("[DEGRADED]", report)
-        self.assertIn(str(self.root / "cron" / "env" / "techsupport_sync.env"), report)
+        self.assertIn(str(self.root / "cron" / "env" / "github_push.env"), report)
         self.assertIn("overridden by container environment variables", report)
         self.assertIn("subPath", report)
         self.assertIn("Refusing to start", report)
 
     def test_blocking_listed_before_degraded(self):
-        report = preflight.format_preflight_report(self._broken(), strict=True)
+        result = preflight.PreflightResult(
+            problems=(
+                preflight.PreflightProblem(Severity.DEGRADED, ("DEGRADED_KEY",), "degraded", "fix"),
+                preflight.PreflightProblem(Severity.BLOCKING, ("BLOCKING_KEY",), "blocking", "fix"),
+            ),
+            sources=(self.root / "cron" / "env" / "github_push.env",),
+        )
+        report = preflight.format_preflight_report(result, strict=True)
         self.assertLess(report.rindex("[BLOCKING]"), report.index("[DEGRADED]"))
 
     def test_warn_mode_says_pipeline_stays_broken(self):
@@ -565,7 +453,7 @@ class ReportFramingTests(PreflightTestCase):
     """
 
     def failing_result(self):
-        self.sync.pop("SLACK_BOT_TOKEN")
+        self.github.pop("GITHUB_TOKEN")
         result = self.run_preflight()
         self.assertTrue(result.blocking)
         return result
@@ -589,7 +477,7 @@ class ReportFramingTests(PreflightTestCase):
                 self.assertIn("This is a running pod", report)
                 # The problems and remediation still have to be there: the
                 # runtime log is an operator's only prompt to go fix this.
-                self.assertIn("SLACK_BOT_TOKEN", report)
+                self.assertIn("GITHUB_TOKEN", report)
                 self.assertIn(preflight.FAILURE_CODE, report)
 
 

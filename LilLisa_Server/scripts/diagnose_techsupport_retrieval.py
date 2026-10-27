@@ -29,7 +29,6 @@ from pathlib import Path
 
 SERVER_ROOT = Path(os.environ.get("LILLISA_SERVER_ROOT", "/app"))
 LILLISA_ENV_PATH = SERVER_ROOT / "env" / "lillisa_server.env"
-SYNC_ENV_PATH = SERVER_ROOT / "cron" / "env" / "techsupport_sync.env"
 GITHUB_ENV_PATH = SERVER_ROOT / "cron" / "env" / "github_push.env"
 TECHSUPPORT_TABLE = "TECHSUPPORT_QA_PAIRS"
 PRODUCT_TABLES = ("IDA", "IDA_QA_PAIRS", "IDDM", "IDDM_QA_PAIRS", "IDO", "IDO_QA_PAIRS", TECHSUPPORT_TABLE)
@@ -87,13 +86,9 @@ for proc in Path("/proc").iterdir():
 # --- 2. Config (presence only) ---
 section("2. Config")
 lillisa = {**read_env(LILLISA_ENV_PATH), **os.environ}
-sync = {**read_env(SYNC_ENV_PATH), **os.environ}
 github = {**read_env(GITHUB_ENV_PATH), **os.environ}
 print(f"  {LILLISA_ENV_PATH} exists: {LILLISA_ENV_PATH.exists()}")
-print(f"  {SYNC_ENV_PATH} exists: {SYNC_ENV_PATH.exists()}")
 print(f"  {GITHUB_ENV_PATH} exists: {GITHUB_ENV_PATH.exists()}")
-for key in ("SLACK_BOT_TOKEN", "TECHSUPPORT_CHANNEL_ID"):
-    print(f"  {key} set: {bool(sync.get(key))}")
 for key in ("GITHUB_TOKEN", "GITHUB_REPO_URL"):
     print(f"  {key} set: {bool(github.get(key))}")
 print(f"  AUTHENTICATION_KEY set: {bool(lillisa.get('AUTHENTICATION_KEY'))}")

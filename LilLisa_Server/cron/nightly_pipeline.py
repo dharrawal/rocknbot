@@ -124,7 +124,7 @@ in-process lock cannot see a second OS process):
 import logging
 import os
 import time
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import jwt
 import requests
@@ -140,16 +140,25 @@ ensure_import_paths()
 SCRIPT_DIR = PACKAGE_ROOT
 PROJECT_ROOT = LILLISA_SERVER_ROOT
 
-import expert_group  # noqa: E402
+try:
+    import expert_group  # noqa: E402
+except ImportError:  # pragma: no cover -- removed once Slack harvesting lives solely in lil-lisa
+    expert_group = None  # type: ignore[assignment]
 from github_sync import push_verified_qa_pairs  # noqa: E402
 from nightly_techsupport_sync import (  # noqa: E402
     channel_state,
+    get_catchup_age_days,
+    get_catchup_interval_days,
+    get_hot_days,
+    get_max_parent_lookups,
+    is_catchup_due,
     load_env,
     load_state,
     paginate_messages,
     parent_activity_ts,
     product_channel_ids,
     save_state,
+    select_parent_lookups,
     sync,
 )
 from pipeline_summary import (  # noqa: E402
@@ -158,6 +167,7 @@ from pipeline_summary import (  # noqa: E402
     format_pipeline_error_alert,
 )
 from techsupport_classifier import (  # noqa: E402
+    classify_formatted_thread,
     classify_thread,
     format_thread_messages,
     has_expert_insight,
@@ -1067,6 +1077,428 @@ def run_pipeline(force: bool = False) -> Dict[str, Any]:
         post_admin_alert(token, admin_channel_id, alert_text)
 
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Slack-free backend entry points for the HTTP boundary driven by lil-lisa
+# ---------------------------------------------------------------------------
+
+
+def get_channel_sync_plan(
+    channel_id: str,
+    *,
+    is_product_channel: bool = False,
+    product: Optional[str] = None,
+    force: bool = False,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Return the sync plan for `channel_id` without making any Slack calls.
+
+    Used by GET /techsupport_channel_state/: tells lil-lisa whether this
+    channel is due for scanning, what `last_run_timestamp` to pass to
+    conversations.history, which `known_thread_ids` are already tracked, and
+    which `lookup_ids` (hot + catch-up) need a parent `latest_reply` check.
+    """
+    if is_product_channel and not get_scan_product_channels():
+        return {
+            "due": False,
+            "reason": "product_scan_disabled",
+            "channel_id": channel_id,
+            "is_product_channel": is_product_channel,
+        }
+
+    state = load_state()
+    per_channel = channel_state(state, channel_id)
+    if not force and not is_channel_check_due(per_channel):
+        return {
+            "due": False,
+            "reason": "interval_not_elapsed",
+            "channel_id": channel_id,
+            "is_product_channel": is_product_channel,
+        }
+
+    if is_product_channel:
+        seed_initial_scan_window(state, per_channel, channel_id, product or channel_id)
+
+    current_now = time.time() if now is None else float(now)
+    threads = per_channel["threads"]
+    previously_known_thread_ids = list(threads.keys())
+    last_run_timestamp = str(per_channel.get("last_run_timestamp", "0"))
+
+    hot_days = get_hot_days()
+    catchup_age_days = get_catchup_age_days()
+    catchup_interval_days = get_catchup_interval_days()
+    max_lookups = get_max_parent_lookups()
+
+    hot_ids, _ = select_parent_lookups(previously_known_thread_ids, threads, current_now, hot_days, max_lookups)
+    lookup_ids = list(hot_ids)
+    catchup_due = is_catchup_due(per_channel, current_now, catchup_interval_days)
+    if catchup_due:
+        catchup_ids, _ = select_parent_lookups(
+            previously_known_thread_ids,
+            threads,
+            current_now,
+            catchup_age_days,
+            max_lookups,
+            exclude=hot_ids,
+        )
+        lookup_ids.extend(catchup_ids)
+
+    return {
+        "due": True,
+        "channel_id": channel_id,
+        "is_product_channel": is_product_channel,
+        "last_run_timestamp": last_run_timestamp,
+        "known_thread_ids": previously_known_thread_ids,
+        "lookup_ids": lookup_ids,
+        "catchup_due": catchup_due,
+        "scan_timestamp": f"{current_now:.6f}",
+    }
+
+
+def record_channel_discovery(
+    channel_id: str,
+    *,
+    is_product_channel: bool = False,
+    scan_timestamp: Optional[str] = None,
+    catchup_due: bool = False,
+    new_threads: Optional[Mapping[str, str]] = None,
+    refreshed_threads: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    """Checkpoint newly discovered and refreshed thread timestamps for `channel_id`.
+
+    Used by POST /techsupport_channel_state/: persists `last_run_timestamp`,
+    `last_seen_reply_ts` for every new/refreshed thread, and (for product
+    channels) caps the candidate list at PRODUCT_SCAN_MAX_THREADS_PER_RUN
+    (hottest first) while saving any overflow in `pending_thread_ids`.
+    """
+    state = load_state()
+    per_channel = channel_state(state, channel_id)
+    threads = per_channel["threads"]
+
+    new_thread_ids: List[str] = []
+    for thread_ts, latest_ts in (new_threads or {}).items():
+        ts_str = str(thread_ts)
+        existing = threads.get(ts_str) or {}
+        threads[ts_str] = {**existing, "last_seen_reply_ts": str(latest_ts)}
+        new_thread_ids.append(ts_str)
+
+    updated_thread_ids: List[str] = []
+    for thread_ts, newest_ts in (refreshed_threads or {}).items():
+        ts_str = str(thread_ts)
+        newest_str = str(newest_ts)
+        previous = threads.setdefault(ts_str, {}).get("last_seen_reply_ts", ts_str)
+        if float(newest_str) > float(previous):
+            updated_thread_ids.append(ts_str)
+        threads[ts_str]["last_seen_reply_ts"] = newest_str
+
+    effective_ts = scan_timestamp or f"{time.time():.6f}"
+    per_channel["last_run_timestamp"] = effective_ts
+    if catchup_due:
+        per_channel["last_catchup_timestamp"] = effective_ts
+
+    if is_product_channel:
+        max_threads = get_product_scan_max_threads_per_run()
+        candidates: List[str] = []
+        for thread_ts in list(per_channel.get("pending_thread_ids") or []) + new_thread_ids + updated_thread_ids:
+            if thread_ts not in candidates:
+                candidates.append(thread_ts)
+        candidates.sort(key=lambda ts: parent_activity_ts(ts, threads.get(ts) or {}), reverse=True)
+        selected, deferred = candidates[:max_threads], candidates[max_threads:]
+        per_channel["pending_thread_ids"] = deferred
+    else:
+        selected = new_thread_ids + updated_thread_ids
+        deferred = []
+
+    save_state(state)
+    return {
+        "channel_id": channel_id,
+        "new_thread_ids": new_thread_ids,
+        "updated_thread_ids": updated_thread_ids,
+        "candidate_thread_ids": selected,
+        "deferred_thread_ids": deferred,
+    }
+
+
+def _process_formatted_techsupport_thread(
+    channel_id: str,
+    thread_ts: str,
+    conversation_thread: str,
+    already_added: bool,
+) -> str:
+    """Slack-free twin of process_thread() operating on pre-formatted text."""
+    related_entry_title = None if already_added else get_related_entry_title(thread_ts)
+    result = classify_formatted_thread(conversation_thread, skip_conclusive=bool(related_entry_title))
+
+    if not result["is_useful"]:
+        return "left_as_is_not_useful" if already_added else "skipped_not_useful"
+
+    if related_entry_title:
+        try:
+            enrich_verified_entry(
+                related_entry_title,
+                result["conversation_thread"],
+                source_channel_id=channel_id,
+                source_thread_ts=thread_ts,
+            )
+            return "enriched"
+        except LookupError as exc:
+            logger.warning(
+                "Thread %s tagged related_entry_title=%r but enrich failed (%s) -- falling back to normal add",
+                thread_ts,
+                related_entry_title,
+                exc,
+            )
+            full_result = classify_formatted_thread(conversation_thread, skip_conclusive=False)
+            if not full_result["is_conclusive"]:
+                return "skipped_not_conclusive"
+            add_verified_qa_pair(full_result["conversation_thread"], thread_ts=thread_ts)
+            return "added"
+
+    if not result["is_conclusive"]:
+        return "left_as_is_not_conclusive" if already_added else "skipped_not_conclusive"
+
+    if already_added:
+        replace_verified_qa_pair(thread_ts, result["conversation_thread"])
+        return "replaced"
+
+    add_verified_qa_pair(result["conversation_thread"], thread_ts=thread_ts)
+    return "added"
+
+
+def _process_formatted_product_thread(
+    channel_id: str,
+    thread_ts: str,
+    conversation_thread: str,
+    already_added: bool,
+    previous_outcome: Optional[str] = None,
+) -> str:
+    """Slack-free twin of process_product_thread() operating on pre-formatted text."""
+    if not has_expert_insight(conversation_thread):
+        return "skipped_no_expert_insight"
+
+    cited_title = get_cited_entry_title(thread_ts)
+
+    if already_added:
+        prior = previous_outcome or ("corrected" if cited_title else "added")
+        if prior == "corrected" and cited_title:
+            result = classify_formatted_thread(conversation_thread, skip_conclusive=True)
+            if not result["is_useful"]:
+                return "left_as_is_not_useful"
+            try:
+                correct_verified_entry(
+                    cited_title,
+                    result["conversation_thread"],
+                    source_channel_id=channel_id,
+                    source_thread_ts=thread_ts,
+                )
+                return "corrected"
+            except LookupError as exc:
+                logger.warning(
+                    "Thread %s previously corrected %r but the entry is gone (%s) -- trying replace",
+                    thread_ts,
+                    cited_title,
+                    exc,
+                )
+        full_result = classify_formatted_thread(conversation_thread, skip_conclusive=False)
+        if not full_result["is_useful"]:
+            return "left_as_is_not_useful"
+        if not full_result["is_conclusive"]:
+            return "left_as_is_not_conclusive"
+        replace_verified_qa_pair(thread_ts, full_result["conversation_thread"])
+        return "replaced"
+
+    if cited_title:
+        result = classify_formatted_thread(conversation_thread, skip_conclusive=True)
+        if not result["is_useful"]:
+            return "skipped_not_useful"
+        try:
+            correct_verified_entry(
+                cited_title,
+                result["conversation_thread"],
+                source_channel_id=channel_id,
+                source_thread_ts=thread_ts,
+            )
+            return "corrected"
+        except LookupError as exc:
+            logger.warning(
+                "Thread %s cited entry %r but correct failed (%s) -- falling back to normal add",
+                thread_ts,
+                cited_title,
+                exc,
+            )
+            full_result = classify_formatted_thread(conversation_thread, skip_conclusive=False)
+            if not full_result["is_conclusive"]:
+                return "skipped_not_conclusive"
+            add_verified_qa_pair(full_result["conversation_thread"], thread_ts=thread_ts)
+            return "added"
+
+    result = classify_formatted_thread(conversation_thread, skip_conclusive=False)
+    if not result["is_useful"]:
+        return "skipped_not_useful"
+    if not result["is_conclusive"]:
+        return "skipped_not_conclusive"
+    add_verified_qa_pair(result["conversation_thread"], thread_ts=thread_ts)
+    return "added"
+
+
+def process_formatted_thread(
+    channel_id: str,
+    thread_ts: str,
+    conversation_thread: str,
+    *,
+    product: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Classify and ingest one pre-formatted thread and atomically checkpoint its state.
+
+    Used by POST /process_techsupport_thread/: immediately persists
+    `added_to_verified_db` (and `outcome` for product channels) in
+    `techsupport_sync_state.json` on disk after a successful ingest, preserving
+    the per-thread crash-recovery guarantee.
+    """
+    state = load_state()
+    threads_state = channel_state(state, channel_id)["threads"]
+    thread_info = threads_state.get(thread_ts) or {}
+    already_added = bool(thread_info.get("added_to_verified_db"))
+
+    if product:
+        outcome = _process_formatted_product_thread(
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            conversation_thread=conversation_thread,
+            already_added=already_added,
+            previous_outcome=thread_info.get("outcome"),
+        )
+        changed = outcome in PRODUCT_CHANGE_KEYS
+        if changed:
+            entry = threads_state.setdefault(thread_ts, {})
+            entry["added_to_verified_db"] = True
+            entry["outcome"] = "corrected" if outcome == "corrected" else "added"
+            save_state(state)
+    else:
+        outcome = _process_formatted_techsupport_thread(
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            conversation_thread=conversation_thread,
+            already_added=already_added,
+        )
+        changed = outcome in ("added", "enriched", "replaced")
+        if outcome in ("added", "enriched"):
+            threads_state.setdefault(thread_ts, {})["added_to_verified_db"] = True
+            save_state(state)
+
+    return {
+        "channel_id": channel_id,
+        "thread_ts": thread_ts,
+        "product": product,
+        "outcome": outcome,
+        "changed": changed,
+    }
+
+
+def _run_index_reload(reload_callback: Optional[Callable[[], Any]] = None) -> Dict[str, Any]:
+    """Reload in-memory QA pair retrievers directly when a callback is given,
+    falling back to reload_techsupport_index() for standalone CLI invocations."""
+    if reload_callback is not None:
+        reload_callback()
+        return {"reloaded": True, "mode": "in_process"}
+    return reload_techsupport_index()
+
+
+def finalize_pipeline_run(
+    *,
+    changed_this_run: bool,
+    run_maintenance: bool = True,
+    reload_callback: Optional[Callable[[], Any]] = None,
+) -> Dict[str, Any]:
+    """Run post-ingest publishing and maintenance without any Slack dependency.
+
+    Used by POST /finalize_techsupport_pipeline_run/:
+      * Pushes techsupport_qa_pairs.md to GitHub and reloads the in-memory
+        retrievers when `changed_this_run` is True.
+      * When `run_maintenance` is True (full nightly run, as opposed to a
+        product-only scan), also runs `sync_edited_entries()` and
+        `run_reembed_if_due()`, reloading the in-memory retrievers again if a
+        contextual re-embed ran.
+      * Collects any step failures into `step_errors` so lil-lisa can post them
+        to the admin Slack channel.
+    """
+    step_errors: List[str] = []
+
+    try:
+        if changed_this_run:
+            github_push_result = push_verified_qa_pairs()
+            logger.info("GitHub push of verified techsupport QA pairs: %s", github_push_result)
+        else:
+            github_push_result = {"pushed": False, "reason": "no_changes_this_run"}
+    except Exception as exc:  # noqa: BLE001
+        github_push_result = {"pushed": False, "error": str(exc)}
+        logger.exception("GitHub push of verified techsupport QA pairs errored")
+        step_errors.append(f"nightly_pipeline.py: GitHub push of verified techsupport QA pairs failed: {exc}")
+
+    try:
+        if changed_this_run:
+            reload_after_ingest_result = _run_index_reload(reload_callback)
+            logger.info("LilLisa_Server techsupport index reload (after ingest): %s", reload_after_ingest_result)
+            if not reload_after_ingest_result.get("reloaded"):
+                step_errors.append(
+                    f"nightly_pipeline.py: LilLisa_Server techsupport index reload (after ingest) did not run: {reload_after_ingest_result}"
+                )
+        else:
+            reload_after_ingest_result = {"reloaded": False, "reason": "no_changes_this_run"}
+    except Exception as exc:  # noqa: BLE001
+        reload_after_ingest_result = {"reloaded": False, "error": str(exc)}
+        logger.exception("LilLisa_Server techsupport index reload (after ingest) errored")
+        step_errors.append(f"nightly_pipeline.py: LilLisa_Server techsupport index reload (after ingest) failed: {exc}")
+
+    if not run_maintenance:
+        return {
+            "github_push": github_push_result,
+            "techsupport_index_reload_after_ingest": reload_after_ingest_result,
+            "step_errors": step_errors,
+        }
+
+    try:
+        review_sync_result = sync_edited_entries()
+        logger.info("Techsupport review sync: %s", review_sync_result)
+    except Exception as exc:  # noqa: BLE001
+        review_sync_result = {"error": str(exc)}
+        logger.exception("Techsupport review sync errored")
+        step_errors.append(f"nightly_pipeline.py: techsupport review sync failed: {exc}")
+
+    try:
+        reembed_result = run_reembed_if_due()
+        logger.info("Contextual re-embed: %s", reembed_result)
+    except Exception as exc:  # noqa: BLE001
+        reembed_result = {"ran": False, "error": str(exc)}
+        logger.exception("Contextual re-embed errored")
+        step_errors.append(f"nightly_pipeline.py: contextual re-embed of TECHSUPPORT_QA_PAIRS failed: {exc}")
+
+    try:
+        if reembed_result.get("ran"):
+            reload_after_reembed_result = _run_index_reload(reload_callback)
+            logger.info("LilLisa_Server techsupport index reload (after reembed): %s", reload_after_reembed_result)
+            if not reload_after_reembed_result.get("reloaded"):
+                step_errors.append(
+                    f"nightly_pipeline.py: LilLisa_Server techsupport index reload (after reembed) did not run: {reload_after_reembed_result}"
+                )
+        else:
+            reload_after_reembed_result = {"reloaded": False, "reason": "reembed_did_not_run"}
+    except Exception as exc:  # noqa: BLE001
+        reload_after_reembed_result = {"reloaded": False, "error": str(exc)}
+        logger.exception("LilLisa_Server techsupport index reload (after reembed) errored")
+        step_errors.append(
+            f"nightly_pipeline.py: LilLisa_Server techsupport index reload (after reembed) failed: {exc}"
+        )
+
+    return {
+        "github_push": github_push_result,
+        "techsupport_index_reload_after_ingest": reload_after_ingest_result,
+        "review_sync": review_sync_result,
+        "reembed": reembed_result,
+        "techsupport_index_reload_after_reembed": reload_after_reembed_result,
+        "step_errors": step_errors,
+    }
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ from expert_group import (
     group_id_for_handle_across_pages,
     group_ids_from_env,
 )
+import techsupport_harvester
 from utils import (
     ESCALATE_VALUE_QUERY_MAX_LENGTH,
     build_escalation_button_value,
@@ -57,12 +58,10 @@ LIL_LISA_SLACK_USERID = lil_lisa_env["LIL_LISA_SLACK_USERID"]
 SLACK_BOT_TOKEN = lil_lisa_env["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = lil_lisa_env["SLACK_APP_TOKEN"]
 CHANNEL_ID_IDDM = lil_lisa_env["CHANNEL_ID_IDDM"]
-ADMIN_CHANNEL_ID_IDDM = lil_lisa_env["ADMIN_CHANNEL_ID_IDDM"]
 CHANNEL_ID_IDA = lil_lisa_env["CHANNEL_ID_IDA"]
-ADMIN_CHANNEL_ID_IDA = lil_lisa_env["ADMIN_CHANNEL_ID_IDA"]
+ADMIN_CHANNEL_ID = lil_lisa_env["ADMIN_CHANNEL_ID"]
 # IDO Slack channels are optional — set to None if not configured
 CHANNEL_ID_IDO = lil_lisa_env.get("CHANNEL_ID_IDO")
-ADMIN_CHANNEL_ID_IDO = lil_lisa_env.get("ADMIN_CHANNEL_ID_IDO")
 if not CHANNEL_ID_IDO:
     logger.warning("CHANNEL_ID_IDO not found in lil-lisa.env — IDO Slack channel support will be disabled")
 
@@ -716,8 +715,8 @@ async def add_expert_verified_qa_pair(item_ts, channel_id, expert_user_id):
             logger.warning(f"Could not extract complete Q&A pair. Question: {bool(user_question)}, Answer: {bool(expert_answer)}")
             return
         
-        # Determine product based on channel
-        product = determine_product(channel_id)
+        # Determine product based on channel (in ADMIN_CHANNEL_ID, parse and strip the inline product tag)
+        product, user_question = determine_product_and_clean_text(channel_id, user_question)
         
         if not product:
             logger.warning(f"Could not determine product for channel {channel_id}")
@@ -943,18 +942,28 @@ async def process_msg(event, say):
     message_ts = event.get("ts")
     conv_id = thread_ts or message_ts
 
-    product = determine_product(channel_id)
-    if product is None:
-        await say(
-            channel=channel_id,
-            text="I am unable to provide answers in this channel. Please refer to the appropriate channels.",
-            thread_ts=orig_thread_ts,
-        )
-        return
-
     # Remove any leading "> " quoting
     text_items = text.split("> ")
     text = text_items[1] if len(text_items) == 2 else text_items[0]
+
+    product, text = await resolve_thread_product(channel_id, thread_ts, text)
+    if product is None:
+        if channel_id == ADMIN_CHANNEL_ID:
+            await say(
+                channel=channel_id,
+                text=(
+                    "In the admin channel, please prefix your question with a product tag "
+                    "(e.g. `[IDA] your question` or `[IDDM] your question`)."
+                ),
+                thread_ts=orig_thread_ts,
+            )
+        else:
+            await say(
+                channel=channel_id,
+                text="I am unable to provide answers in this channel. Please refer to the appropriate channels.",
+                thread_ts=orig_thread_ts,
+            )
+        return
 
     is_expert_answering = False
     if text.lower().startswith("#answer") and await expert_resolver.is_expert(user_id, product):
@@ -1294,17 +1303,6 @@ async def reaction(event, say):
     item_user = event["item_user"]
     reactor_user_id = event["user"]
 
-    # Determine product for this channel
-    product = determine_product(channel_id)
-    if not product:
-        logger.info(f"[IGNORE] Unknown channel {channel_id}, skipping reaction.")
-        return
-
-    # Check if the reactor is an expert (a member of the product's expert user group).
-    # An unreadable expert group raises ExpertLookupError out of this handler on
-    # purpose: Bolt logs it, and a silent "nobody is an expert" is worse.
-    is_expert = await expert_resolver.is_expert(reactor_user_id, product)
-
     # 1) Determine if this is a 👍 or a 👎
     reaction_name = event["reaction"]
     thumbs_up = None
@@ -1313,10 +1311,26 @@ async def reaction(event, say):
     elif reaction_name.startswith("-1"):
         thumbs_up = False
 
+    # Fast reject for channels that are neither a product channel nor ADMIN_CHANNEL_ID
+    if determine_product(channel_id) is None and channel_id != ADMIN_CHANNEL_ID:
+        logger.info(f"[IGNORE] Unknown channel {channel_id}, skipping reaction.")
+        return
+
     # Get conversation details
     resp = await conversations_replies_with_retry(ts=item_ts, channel=channel_id)
     first_msg = resp["messages"][0]
     conv_id = first_msg.get("thread_ts") or first_msg.get("ts")
+
+    # Determine product for this channel (or from the thread parent's inline tag in ADMIN_CHANNEL_ID)
+    product, _ = await resolve_thread_product(channel_id, conv_id, first_msg.get("text", ""))
+    if not product:
+        logger.info(f"[IGNORE] Unknown product for channel {channel_id} thread {conv_id}, skipping reaction.")
+        return
+
+    # Check if the reactor is an expert (a member of the product's expert user group).
+    # An unreadable expert group raises ExpertLookupError out of this handler on
+    # purpose: Bolt logs it, and a silent "nobody is an expert" is worse.
+    is_expert = await expert_resolver.is_expert(reactor_user_id, product)
 
     # Check if this thread has already been endorsed (reactions allow changing thumbs up/down)
     if not check_and_update_endorsement(conv_id, "endorsed", "reaction", thumbs_up):
@@ -1400,7 +1414,49 @@ async def check_members(channel_id, user_id):
         print(f"Error occurred: {str(exc)}")
 
 
-def determine_product(channel_id):
+_ADMIN_PRODUCT_TAG_RE = re.compile(
+    r"^\s*(?:<@[^>]+>\s*)*(?:\[(?P<bracket>IDA|IDDM|IDO)\]|(?P<colon>IDA|IDDM|IDO)\s*:)\s*(?P<rest>[\s\S]*)$",
+    re.IGNORECASE,
+)
+
+
+def extract_admin_product_tag(text: Optional[str]) -> Tuple[Optional[str], str]:
+    """Parse a leading `[PRODUCT]` or `PRODUCT:` tag from `text` (used ONLY in ADMIN_CHANNEL_ID).
+
+    Returns `(product, cleaned_text)` when a supported product tag is present,
+    or `(None, text)` otherwise.
+    """
+    raw = text or ""
+    match = _ADMIN_PRODUCT_TAG_RE.match(raw)
+    if not match:
+        return None, raw
+    product = (match.group("bracket") or match.group("colon") or "").upper()
+    if product == "IDO" and not CHANNEL_ID_IDO:
+        return None, raw
+    return product, match.group("rest").strip()
+
+
+def determine_product_and_clean_text(channel_id: str, text: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """Return `(product, cleaned_text)` for `channel_id`.
+
+    Product channels (`CHANNEL_ID_IDDM`, `CHANNEL_ID_IDA`, `CHANNEL_ID_IDO`)
+    unconditionally map to their product and never inspect or strip inline tags
+    from `text` (so mentioning `[IDA]` inside `#iddm` has zero effect).
+    Only `ADMIN_CHANNEL_ID` consults `extract_admin_product_tag(text)`.
+    """
+    raw = text or ""
+    if channel_id == CHANNEL_ID_IDDM:
+        return "IDDM", raw
+    if channel_id == CHANNEL_ID_IDA:
+        return "IDA", raw
+    if CHANNEL_ID_IDO and channel_id == CHANNEL_ID_IDO:
+        return "IDO", raw
+    if channel_id == ADMIN_CHANNEL_ID:
+        return extract_admin_product_tag(raw)
+    return None, raw
+
+
+def determine_product(channel_id, text: Optional[str] = None):
     """
     Determines the product string from a channel_id.
 
@@ -1410,22 +1466,47 @@ def determine_product(channel_id):
 
     Parameters:
     - channel_id (str): The ID of the channel to check.
+    - text (str, optional): Message text, consulted only when channel_id == ADMIN_CHANNEL_ID.
 
     Returns:
     - str or None: the product for this channel, or None if it is not a
       product channel.
     """
-
-    if channel_id == CHANNEL_ID_IDDM or channel_id == ADMIN_CHANNEL_ID_IDDM:
-        product = "IDDM"
-    elif channel_id == CHANNEL_ID_IDA or channel_id == ADMIN_CHANNEL_ID_IDA:
-        product = "IDA"
-    elif CHANNEL_ID_IDO and (channel_id == CHANNEL_ID_IDO or channel_id == ADMIN_CHANNEL_ID_IDO):
-        product = "IDO"
-    else:
-        return None
-
+    product, _ = determine_product_and_clean_text(channel_id, text)
     return product
+
+
+async def resolve_thread_product(
+    channel_id: str,
+    thread_ts: Optional[str],
+    text: Optional[str] = None,
+) -> Tuple[Optional[str], str]:
+    """Resolve `(product, cleaned_text)` for a message or reaction in `channel_id`.
+
+    In product channels, returns the channel's product immediately. In
+    `ADMIN_CHANNEL_ID`, checks `text` for a leading `[IDA]`/`[IDDM]`/`[IDO]` tag
+    first, and if absent on a thread reply/reaction (`thread_ts` is set),
+    inspects the thread's parent message so follow-ups and reactions inherit
+    the thread's product automatically.
+    """
+    product, cleaned = determine_product_and_clean_text(channel_id, text)
+    if product is not None or channel_id != ADMIN_CHANNEL_ID or not thread_ts:
+        return product, cleaned
+
+    try:
+        thread_resp = await conversations_replies_with_retry(ts=thread_ts, channel=channel_id)
+        messages = thread_resp.get("messages") or []
+        if messages:
+            parent_text = messages[0].get("text", "")
+            parent_items = parent_text.split("> ")
+            parent_clean = parent_items[1] if len(parent_items) == 2 else parent_items[0]
+            parent_product, _ = extract_admin_product_tag(parent_clean)
+            if parent_product:
+                return parent_product, cleaned
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning(f"Failed to inspect parent thread {thread_ts} in ADMIN_CHANNEL_ID: {exc}")
+
+    return None, cleaned
 
 
 def check_and_update_endorsement(conv_id, action_type="endorsed", endorsement_source="message", thumbs_up=None):
@@ -1518,6 +1599,14 @@ def update_tracker_entry(conv_id, field, value):
     return True
 
 
+def _configured_products() -> List[str]:
+    """Return the list of active products for this bot deployment."""
+    products = ["IDDM", "IDA"]
+    if CHANNEL_ID_IDO:
+        products.append("IDO")
+    return products
+
+
 @app.command("/get_golden_qa_pairs")
 async def get_golden_qa_pairs(ack, body, say):
     """
@@ -1534,10 +1623,11 @@ async def get_golden_qa_pairs(ack, body, say):
     await ack()
     user_id = body.get("user_id")
     channel_id = body.get("channel_id")
+    cmd_text = (body.get("text") or "").strip()
 
     direct_message_convo = await app.client.conversations_open(users=user_id)
     dm_channel_id = direct_message_convo.data["channel"]["id"]
-    contains_user = await check_members(ADMIN_CHANNEL_ID_IDDM, user_id) or await check_members(ADMIN_CHANNEL_ID_IDA, user_id) or (ADMIN_CHANNEL_ID_IDO and await check_members(ADMIN_CHANNEL_ID_IDO, user_id)) 
+    contains_user = await check_members(ADMIN_CHANNEL_ID, user_id)
     if not contains_user:
         # Return an error message or handle unauthorized users
         await say(
@@ -1545,9 +1635,16 @@ async def get_golden_qa_pairs(ack, body, say):
         )
         return
 
-    product = determine_product(channel_id)
+    product = determine_product(channel_id, cmd_text)
+    if not product and cmd_text.upper() in ("IDA", "IDDM", "IDO"):
+        if cmd_text.upper() != "IDO" or CHANNEL_ID_IDO:
+            product = cmd_text.upper()
 
-    if product is None:
+    products_to_fetch = [product] if product else (
+        _configured_products() if channel_id == ADMIN_CHANNEL_ID else []
+    )
+
+    if not products_to_fetch:
         _ = await say(
             channel=dm_channel_id,
             text="I am unable to retrieve the golden QA pairs from this channel. Please go to the approriate channel and try the command again.",
@@ -1556,24 +1653,26 @@ async def get_golden_qa_pairs(ack, body, say):
     try:
         # Call the get_golden_qa_pairs API
         full_url = f"{BASE_URL}/get_golden_qa_pairs/"
-        if response := await _requests_call(requests.post, 
-            full_url,
-            params={
-                "product": product,  # pylint: disable=missing-timeout
-                "encrypted_key": ENCRYPTED_AUTHENTICATION_KEY,
-            },
-            timeout=60,
-        ):
-            await app.client.files_upload_v2(
-                file=response.content,
-                filename="qa_pairs.md",
-                channel=dm_channel_id,
-                initial_comment="Here are the QA pairs you requested!",
-            )
-        else:
-            error_msg = f"Call to lil-lisa server {full_url} has failed."
-            logger.error(error_msg)
-            return error_msg
+        for target_product in products_to_fetch:
+            if response := await _requests_call(requests.post, 
+                full_url,
+                params={
+                    "product": target_product,  # pylint: disable=missing-timeout
+                    "encrypted_key": ENCRYPTED_AUTHENTICATION_KEY,
+                },
+                timeout=60,
+            ):
+                filename = "qa_pairs.md" if len(products_to_fetch) == 1 else f"{target_product.lower()}_qa_pairs.md"
+                await app.client.files_upload_v2(
+                    file=response.content,
+                    filename=filename,
+                    channel=dm_channel_id,
+                    initial_comment="Here are the QA pairs you requested!",
+                )
+            else:
+                error_msg = f"Call to lil-lisa server {full_url} has failed."
+                logger.error(error_msg)
+                return error_msg
 
     except Exception as exc:  # pylint: disable=broad-except
         logger.error(f"An error occurred during the asynchronous call get_golden_qa_pairs: {exc}")
@@ -1598,7 +1697,7 @@ async def update_golden_qa_pairs(ack, body, say):    # pylint: disable=too-many-
     channel_id = body.get("channel_id")
     direct_message_convo = await app.client.conversations_open(users=user_id)
     dm_channel_id = direct_message_convo.data["channel"]["id"]
-    contains_user = await check_members(ADMIN_CHANNEL_ID_IDDM, user_id) or await check_members(ADMIN_CHANNEL_ID_IDA, user_id) or (ADMIN_CHANNEL_ID_IDO and await check_members(ADMIN_CHANNEL_ID_IDO, user_id))
+    contains_user = await check_members(ADMIN_CHANNEL_ID, user_id)
     if not contains_user:
         # Return an error message or handle unauthorized users
         await say(
@@ -1606,7 +1705,7 @@ async def update_golden_qa_pairs(ack, body, say):    # pylint: disable=too-many-
         )
         return
 
-    product = determine_product(channel_id)
+    product = determine_product(channel_id) or ("ALL" if channel_id == ADMIN_CHANNEL_ID else None)
 
     if not product:
         _ = await say(
@@ -1636,6 +1735,33 @@ async def update_golden_qa_pairs(ack, body, say):    # pylint: disable=too-many-
         return "An error occured"
 
 
+def _make_sync_expert_resolver(loop: asyncio.AbstractEventLoop):
+    """Bridge async `expert_resolver.expert_user_ids` for worker-thread harvester runs."""
+
+    def _resolve(product: str) -> List[str]:
+        future = asyncio.run_coroutine_threadsafe(expert_resolver.expert_user_ids(product), loop)
+        return future.result(timeout=60)
+
+    return _resolve
+
+
+def _trigger_techsupport_pipeline(force: bool = True) -> str:
+    """Spawn an in-process background techsupport harvest + backend ingest run."""
+    if techsupport_harvester.is_running():
+        return "Nightly techsupport pipeline is already running. This request was ignored."
+    loop = asyncio.get_running_loop()
+    resolve_experts = _make_sync_expert_resolver(loop)
+    asyncio.create_task(
+        asyncio.to_thread(
+            techsupport_harvester.run_once,
+            lil_lisa_env,
+            resolve_experts=resolve_experts,
+            force=force,
+        )
+    )
+    return "Nightly techsupport pipeline initiated. Progress and the run summary are in the logs."
+
+
 @app.command("/run_nightly_pipeline")
 async def run_nightly_pipeline(ack, body, say):
     """Start the server's techsupport pipeline for an authorized administrator.
@@ -1648,11 +1774,7 @@ async def run_nightly_pipeline(ack, body, say):
     user_id = body.get("user_id")
     direct_message_convo = await app.client.conversations_open(users=user_id)
     dm_channel_id = direct_message_convo.data["channel"]["id"]
-    contains_user = (
-        await check_members(ADMIN_CHANNEL_ID_IDDM, user_id)
-        or await check_members(ADMIN_CHANNEL_ID_IDA, user_id)
-        or (ADMIN_CHANNEL_ID_IDO and await check_members(ADMIN_CHANNEL_ID_IDO, user_id))
-    )
+    contains_user = await check_members(ADMIN_CHANNEL_ID, user_id)
     if not contains_user:
         await say(
             text=(
@@ -1663,16 +1785,9 @@ async def run_nightly_pipeline(ack, body, say):
         )
         return
 
-    full_url = f"{BASE_URL}/run_nightly_pipeline/"
     try:
-        response = await _requests_call(
-            requests.post,
-            full_url,
-            params={"encrypted_key": ENCRYPTED_AUTHENTICATION_KEY},
-            timeout=60,
-        )
-        response.raise_for_status()
-        await say(channel=dm_channel_id, text=response.text)
+        message = _trigger_techsupport_pipeline(force=True)
+        await say(channel=dm_channel_id, text=message)
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Unable to start nightly techsupport pipeline: %s", exc)
         await say(
@@ -1760,7 +1875,7 @@ async def rebuild_docs_traditional(ack, body, say):
 
     direct_message_convo = await app.client.conversations_open(users=user_id)
     dm_channel_id = direct_message_convo.data["channel"]["id"]
-    contains_user = await check_members(ADMIN_CHANNEL_ID_IDDM, user_id) or await check_members(ADMIN_CHANNEL_ID_IDA, user_id) or (ADMIN_CHANNEL_ID_IDO and await check_members(ADMIN_CHANNEL_ID_IDO, user_id))
+    contains_user = await check_members(ADMIN_CHANNEL_ID, user_id)
     if not contains_user:
         # Return an error message or handle unauthorized users
         await say(
@@ -1768,7 +1883,7 @@ async def rebuild_docs_traditional(ack, body, say):
         )
         return
 
-    product = determine_product(channel_id)
+    product = determine_product(channel_id) or ("ALL" if channel_id == ADMIN_CHANNEL_ID else None)
 
     if product is None:
         _ = await say(
@@ -1818,7 +1933,7 @@ async def rebuild_docs_contextual(ack, body, say):
 
     direct_message_convo = await app.client.conversations_open(users=user_id)
     dm_channel_id = direct_message_convo.data["channel"]["id"]
-    contains_user = await check_members(ADMIN_CHANNEL_ID_IDDM, user_id) or await check_members(ADMIN_CHANNEL_ID_IDA, user_id) or (ADMIN_CHANNEL_ID_IDO and await check_members(ADMIN_CHANNEL_ID_IDO, user_id))
+    contains_user = await check_members(ADMIN_CHANNEL_ID, user_id)
     if not contains_user:
         # Return an error message or handle unauthorized users
         await say(
@@ -1826,7 +1941,7 @@ async def rebuild_docs_contextual(ack, body, say):
         )
         return
 
-    product = determine_product(channel_id)
+    product = determine_product(channel_id) or ("ALL" if channel_id == ADMIN_CHANNEL_ID else None)
 
     if product is None:
         _ = await say(
@@ -1877,7 +1992,7 @@ async def cleanup_sessions(ack, body, say):
     dm_channel_id = direct_message_convo.data["channel"]["id"]
     
     # Check if user is authorized (in admin channels)
-    contains_user = await check_members(ADMIN_CHANNEL_ID_IDDM, user_id) or await check_members(ADMIN_CHANNEL_ID_IDA, user_id) or (ADMIN_CHANNEL_ID_IDO and await check_members(ADMIN_CHANNEL_ID_IDO, user_id)) 
+    contains_user = await check_members(ADMIN_CHANNEL_ID, user_id) 
     if not contains_user:
         # Return an error message for unauthorized users
         await say(
@@ -1944,6 +2059,13 @@ async def start_slackapp():
     """
     try:
         await log_configured_channels(lil_lisa_env, _channel_info)
+        loop = asyncio.get_running_loop()
+        asyncio.create_task(
+            techsupport_harvester.start_scheduler_loop(
+                lil_lisa_env,
+                resolve_experts=_make_sync_expert_resolver(loop),
+            )
+        )
         handler = AsyncSocketModeHandler(app, SLACK_APP_TOKEN)
         await handler.start_async()
     except Exception as exc:  # pylint:disable=broad-except

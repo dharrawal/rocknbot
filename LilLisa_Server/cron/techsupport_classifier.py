@@ -312,6 +312,33 @@ def has_expert_insight(conversation_thread: str) -> bool:
     return is_yes_answer(result.has_expert_insight)
 
 
+def classify_formatted_thread(
+    conversation_thread: str,
+    skip_conclusive: bool = False,
+) -> Dict[str, Any]:
+    """Classify a pre-formatted conversation thread string as useful / conclusive.
+
+    Slack-free twin of classify_thread(): callers (such as the LilLisa_Server
+    HTTP endpoint driven by lil-lisa) that already formatted the Slack thread
+    text with speaker roles pass `conversation_thread` directly so the backend
+    does not need a Slack token or Slack API access.
+    """
+    configure_dspy_lm()
+    useful_result = check_useful(conversation_thread=conversation_thread)
+    is_useful = is_yes_answer(useful_result.is_useful)
+
+    is_conclusive: Optional[bool] = None
+    if is_useful and not skip_conclusive:
+        conclusive_result = check_conclusive(conversation_thread=conversation_thread)
+        is_conclusive = is_yes_answer(conclusive_result.is_conclusive)
+
+    return {
+        "is_useful": is_useful,
+        "is_conclusive": is_conclusive,
+        "conversation_thread": conversation_thread,
+    }
+
+
 def classify_thread(
     messages: List[Dict[str, Any]],
     slack_token: Optional[str] = None,
@@ -339,24 +366,10 @@ def classify_thread(
     so bot and expert turns are role-tagged in the text the classifiers see.
     Both are optional: omitting them reproduces the previous plain formatting.
     """
-    configure_dspy_lm()
     conversation_thread = format_thread_messages(
         messages,
         slack_token=slack_token,
         bot_user_id=bot_user_id,
         expert_user_ids=expert_user_ids,
     )
-
-    useful_result = check_useful(conversation_thread=conversation_thread)
-    is_useful = is_yes_answer(useful_result.is_useful)
-
-    is_conclusive: Optional[bool] = None
-    if is_useful and not skip_conclusive:
-        conclusive_result = check_conclusive(conversation_thread=conversation_thread)
-        is_conclusive = is_yes_answer(conclusive_result.is_conclusive)
-
-    return {
-        "is_useful": is_useful,
-        "is_conclusive": is_conclusive,
-        "conversation_thread": conversation_thread,
-    }
+    return classify_formatted_thread(conversation_thread, skip_conclusive=skip_conclusive)

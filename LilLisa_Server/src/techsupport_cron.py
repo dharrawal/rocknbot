@@ -20,7 +20,7 @@ import sys
 import threading
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
 from src import utils
 
@@ -44,7 +44,13 @@ if CRON_ROOT and str(CRON_ROOT) not in sys.path:
 
 try:
     # Needs CRON_ROOT on sys.path above; the cron package uses flat imports.
-    from nightly_pipeline import run_pipeline, run_product_channel_scan  # noqa: E402
+    from nightly_pipeline import (  # noqa: E402
+        finalize_pipeline_run,
+        get_channel_sync_plan,
+        process_formatted_thread,
+        record_channel_discovery,
+        run_pipeline,
+    )
 
     # techsupport_preflight (pr42-44j.1/.2) lives in the same cron package, so it fails
     # to import exactly when nightly_pipeline does -- the "broken cron install" case
@@ -56,15 +62,16 @@ try:
     import techsupport_bootstrap  # noqa: E402
 
     # Same package: logs which Slack channel each configured channel ID names.
-    import slack_channel_check  # noqa: E402
 
     IMPORT_ERROR: Optional[str] = None
 except Exception as exc:  # noqa: BLE001 -- a broken cron install must not stop the API from serving
+    finalize_pipeline_run = None  # type: ignore[assignment]
+    get_channel_sync_plan = None  # type: ignore[assignment]
+    process_formatted_thread = None  # type: ignore[assignment]
+    record_channel_discovery = None  # type: ignore[assignment]
     run_pipeline = None  # type: ignore[assignment]
-    run_product_channel_scan = None  # type: ignore[assignment]
     techsupport_preflight = None  # type: ignore[assignment]
     techsupport_bootstrap = None  # type: ignore[assignment]
-    slack_channel_check = None  # type: ignore[assignment]
     IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 _run_lock = threading.Lock()
@@ -299,15 +306,6 @@ def run_startup_preflight() -> None:
     utils.logger.error(report)
 
 
-def log_slack_channels() -> Dict[str, str]:
-    """Called once from main.lifespan after run_startup_preflight(): logs the
-    Slack channel name behind each configured channel ID so a wrong ID is
-    visible in the startup log. Best-effort; see cron/slack_channel_check.py."""
-    if slack_channel_check is None:
-        return {}
-    return slack_channel_check.log_configured_channels()
-
-
 def run_startup_bootstrap(reload_retrievers: Optional[Callable[[], None]] = None) -> Dict[str, Any]:
     """Called once, synchronously, from main.lifespan between
     run_startup_preflight() and start_scheduler(): clones GITHUB_REPO_URL,
@@ -465,35 +463,6 @@ def health_status_code(payload: Dict[str, Any]) -> int:
     return 200 if (payload["ok"] or opted_out) else 503
 
 
-def run_product_channel_scan_once(force: bool = False) -> Dict[str, Any]:
-    """Run just the product-channel expert-correction pass, unless a run is
-    already in flight.
-
-    The companion to run_once() for POST /run_product_channel_scan/: same
-    lock, same "drop rather than queue" behaviour, same never-raises contract
-    (the caller is a FastAPI BackgroundTask, which would swallow the
-    exception). `force` bypasses the per-channel interval gate.
-    """
-    if run_product_channel_scan is None:
-        utils.logger.error("Product-channel scan unavailable: %s", IMPORT_ERROR)
-        return {"ran": False, "reason": "unavailable", "error": IMPORT_ERROR}
-
-    if not _run_lock.acquire(blocking=False):
-        utils.logger.info("Techsupport pipeline already running -- ignoring this product-channel scan trigger")
-        return {"ran": False, "reason": "already_running"}
-
-    try:
-        utils.logger.info("Product-channel expert-correction scan starting (force=%s)", force)
-        summary = run_product_channel_scan(force=force)
-        utils.logger.info("Product-channel expert-correction scan finished: %s", summary)
-        return {"ran": True, "summary": summary}
-    except Exception as exc:  # noqa: BLE001
-        utils.logger.critical("Product-channel expert-correction scan failed: %s", exc, exc_info=True)
-        return {"ran": False, "error": str(exc)}
-    finally:
-        _run_lock.release()
-
-
 def tick_minutes() -> int:
     raw = (utils.LILLISA_SERVER_ENV_DICT.get("TECHSUPPORT_PIPELINE_TICK_MINUTES") or "").strip()
     if not raw:
@@ -539,3 +508,84 @@ async def stop_scheduler(task: Optional[asyncio.Task]) -> None:
     task.cancel()
     with suppress(asyncio.CancelledError):
         await task
+
+
+def channel_sync_plan(
+    channel_id: str,
+    *,
+    is_product_channel: bool = False,
+    product: Optional[str] = None,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Return the Slack-free sync plan for `channel_id`, serialized under `_run_lock`."""
+    if get_channel_sync_plan is None:
+        raise RuntimeError(f"Techsupport pipeline unavailable: {IMPORT_ERROR}")
+    with _run_lock:
+        return get_channel_sync_plan(
+            channel_id,
+            is_product_channel=is_product_channel,
+            product=product,
+            force=force,
+        )
+
+
+def checkpoint_channel_discovery(
+    channel_id: str,
+    *,
+    is_product_channel: bool = False,
+    scan_timestamp: Optional[str] = None,
+    catchup_due: bool = False,
+    new_threads: Optional[Mapping[str, str]] = None,
+    refreshed_threads: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    """Persist discovered/refreshed thread timestamps for `channel_id`, serialized under `_run_lock`."""
+    if record_channel_discovery is None:
+        raise RuntimeError(f"Techsupport pipeline unavailable: {IMPORT_ERROR}")
+    with _run_lock:
+        return record_channel_discovery(
+            channel_id,
+            is_product_channel=is_product_channel,
+            scan_timestamp=scan_timestamp,
+            catchup_due=catchup_due,
+            new_threads=new_threads,
+            refreshed_threads=refreshed_threads,
+        )
+
+
+def process_thread_payload(
+    channel_id: str,
+    thread_ts: str,
+    conversation_thread: str,
+    *,
+    product: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Classify and ingest one pre-formatted thread, serialized under `_run_lock`."""
+    if process_formatted_thread is None:
+        raise RuntimeError(f"Techsupport pipeline unavailable: {IMPORT_ERROR}")
+    with _run_lock:
+        return process_formatted_thread(
+            channel_id,
+            thread_ts,
+            conversation_thread,
+            product=product,
+        )
+
+
+def finalize_run(
+    *,
+    changed_this_run: bool,
+    run_maintenance: bool = True,
+    reload_retrievers: Optional[Callable[[], Any]] = None,
+) -> Dict[str, Any]:
+    """Run post-ingest publishing and maintenance, serialized under `_run_lock`."""
+    if finalize_pipeline_run is None:
+        raise RuntimeError(f"Techsupport pipeline unavailable: {IMPORT_ERROR}")
+    with _run_lock:
+        result = finalize_pipeline_run(
+            changed_this_run=changed_this_run,
+            run_maintenance=run_maintenance,
+            reload_callback=reload_retrievers,
+        )
+        _record_last_run(failed=bool(result.get("step_errors")))
+        return result
+

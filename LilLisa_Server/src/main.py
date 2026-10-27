@@ -15,7 +15,7 @@ import zipfile
 import pathlib
 from contextlib import asynccontextmanager
 from enum import Enum
-from typing import Any, AsyncGenerator, Generator, Optional, Sequence, List
+from typing import Any, AsyncGenerator, Dict, Generator, Optional, Sequence, List
 
 import git
 import jwt
@@ -32,7 +32,7 @@ from fastapi.responses import (
     JSONResponse
 )
 from litellm import completion
-from pydantic import ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from llama_index.core import (
     Document,
     Settings,
@@ -572,7 +572,6 @@ async def lifespan(_app: FastAPI):
     # this module (src.main) -- see tests/test_techsupport_cron_product_scan.py's
     # docstring -- so this call site stays thin on purpose.
     techsupport_cron.run_startup_preflight()
-    techsupport_cron.log_slack_channels()
 
     # Reconcile the verified techsupport markdown with GITHUB_REPO_URL (the
     # side with more entries wins: pull if the repo is ahead, push if local
@@ -590,10 +589,7 @@ async def lifespan(_app: FastAPI):
         reload_retrievers=lambda: create_qa_pairs_lancedb_retrievers_and_indices(LANCEDB_FOLDERPATH)
     )
 
-    pipeline_scheduler_task = techsupport_cron.start_scheduler()
-
     yield
-    await techsupport_cron.stop_scheduler(pipeline_scheduler_task)
     os.unsetenv("OPENAI_API_KEY")
     os.unsetenv("VOYAGE_API_KEY")
     litellm.api_key = None
@@ -1293,90 +1289,6 @@ async def reload_techsupport_qa_pairs(encrypted_key: str) -> dict:
         raise HTTPException(status_code=500, detail="Internal error in reload_techsupport_qa_pairs()") from exc
 
 
-@app.post("/run_nightly_pipeline/", response_model=str, response_class=PlainTextResponse)
-async def run_nightly_pipeline(encrypted_key: str, background_tasks: BackgroundTasks) -> str:
-    """
-    Runs cron/nightly_pipeline.py in this process, in the background.
-
-    Same code host cron runs; this is the trigger for deployments where the API
-    image is the only thing shipped (no host access, no second container). An
-    external scheduler can POST here on a timer, and ops can POST manually to
-    force a run. The pipeline is self-gating on TECHSUPPORT_SYNC_INTERVAL_HOURS,
-    so an extra call is cheap rather than harmful.
-
-    Overlapping calls are dropped rather than queued -- see techsupport_cron.run_once.
-
-    Args:
-        encrypted_key (str): JWT key for authentication.
-        background_tasks (BackgroundTasks): FastAPI background task manager.
-
-    Returns:
-        str: Immediate confirmation message (the run itself takes minutes).
-    """
-    try:
-        jwt.decode(encrypted_key, AUTHENTICATION_KEY, algorithms="HS256")
-    except jwt.exceptions.InvalidSignatureError as e:
-        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
-
-    if not techsupport_cron.is_available():
-        utils.logger.error(
-            "run_nightly_pipeline() requested but the cron package is unavailable: %s", techsupport_cron.IMPORT_ERROR
-        )
-        raise HTTPException(status_code=503, detail="Nightly techsupport pipeline is not installed in this image.")
-
-    if techsupport_cron.is_running():
-        return "Nightly techsupport pipeline is already running. This request was ignored."
-
-    background_tasks.add_task(techsupport_cron.run_once, force=True)
-    return "Nightly techsupport pipeline initiated. Progress and the run summary are in the server logs."
-
-
-@app.post("/run_product_channel_scan/", response_model=str, response_class=PlainTextResponse)
-async def run_product_channel_scan(encrypted_key: str, background_tasks: BackgroundTasks, force: bool = True) -> str:
-    """
-    Runs only the product-channel expert-correction pass, in this process, in the background.
-
-    The narrow sibling of /run_nightly_pipeline/: it scans the IDA/IDDM/IDO
-    channels for expert replies and publishes what changed (GitHub push plus
-    index reload), but skips the tech support loop, the review sync and the
-    contextual re-embed.
-
-    `force` defaults to True because a manual trigger is an operator saying
-    "scan now": with the default, the per-channel TECHSUPPORT_SYNC_INTERVAL_HOURS
-    gate is bypassed and every configured channel is scanned. Pass force=false
-    to respect that gate, i.e. to behave exactly like the nightly run.
-
-    Shares one lock with the nightly pipeline, so a scan landing during a
-    nightly run (or vice versa) is dropped rather than queued -- see
-    techsupport_cron.run_product_channel_scan_once.
-
-    Args:
-        encrypted_key (str): JWT key for authentication.
-        background_tasks (BackgroundTasks): FastAPI background task manager.
-        force (bool): Bypass the per-channel interval gate. Defaults to True.
-
-    Returns:
-        str: Immediate confirmation message (the scan itself takes minutes).
-    """
-    try:
-        _require_jwt(encrypted_key)
-    except jwt.exceptions.InvalidSignatureError as e:
-        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
-
-    if not techsupport_cron.is_available():
-        utils.logger.error(
-            "run_product_channel_scan() requested but the cron package is unavailable: %s",
-            techsupport_cron.IMPORT_ERROR,
-        )
-        raise HTTPException(status_code=503, detail="Nightly techsupport pipeline is not installed in this image.")
-
-    if techsupport_cron.is_running():
-        return "Techsupport pipeline is already running. This request was ignored."
-
-    background_tasks.add_task(techsupport_cron.run_product_channel_scan_once, force)
-    return "Product-channel expert-correction scan initiated. Progress and the run summary are in the server logs."
-
-
 @app.get("/health/techsupport_pipeline", response_class=JSONResponse)
 async def techsupport_pipeline_health() -> JSONResponse:
     """
@@ -1465,6 +1377,155 @@ async def tag_techsupport_thread(thread_ts: str, related_entry_title: str, encry
     except Exception as exc:
         utils.logger.error("Failed to tag techsupport thread %s: %s", thread_ts, exc)
         raise HTTPException(status_code=500, detail="Failed to tag techsupport thread") from exc
+
+
+class TechsupportChannelDiscoveryPayload(BaseModel):
+    """Payload posted by lil-lisa after scanning a Slack channel's history."""
+
+    channel_id: str
+    is_product_channel: bool = False
+    scan_timestamp: Optional[str] = None
+    catchup_due: bool = False
+    new_threads: Dict[str, str] = Field(default_factory=dict)
+    refreshed_threads: Dict[str, str] = Field(default_factory=dict)
+
+
+class ProcessTechsupportThreadPayload(BaseModel):
+    """Payload posted by lil-lisa for a single pre-formatted Slack thread."""
+
+    channel_id: str
+    thread_ts: str
+    conversation_thread: str
+    product: Optional[str] = None
+
+
+class FinalizeTechsupportPipelinePayload(BaseModel):
+    """Payload posted by lil-lisa at the end of a techsupport pipeline pass."""
+
+    changed_this_run: bool = False
+    run_maintenance: bool = True
+
+
+@app.get("/techsupport_channel_state/", response_model=dict, response_class=JSONResponse)
+async def get_techsupport_channel_state(
+    channel_id: str,
+    encrypted_key: str,
+    is_product_channel: bool = False,
+    product: Optional[str] = None,
+    force: bool = False,
+) -> dict:
+    """Return the Slack-free sync plan for `channel_id` (due status, oldest ts, lookup_ids)."""
+    try:
+        _require_jwt(encrypted_key)
+    except jwt.exceptions.InvalidSignatureError as e:
+        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
+
+    if not techsupport_cron.is_available():
+        raise HTTPException(status_code=503, detail="Nightly techsupport pipeline is not installed in this image.")
+
+    try:
+        return await asyncio.to_thread(
+            techsupport_cron.channel_sync_plan,
+            channel_id,
+            is_product_channel=is_product_channel,
+            product=product,
+            force=force,
+        )
+    except Exception as exc:
+        utils.logger.error("Failed to compute techsupport sync plan for %s: %s", channel_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to compute sync plan: {exc}") from exc
+
+
+@app.post("/techsupport_channel_state/", response_model=dict, response_class=JSONResponse)
+async def post_techsupport_channel_state(
+    payload: TechsupportChannelDiscoveryPayload,
+    encrypted_key: str,
+) -> dict:
+    """Checkpoint newly discovered and refreshed thread timestamps for `payload.channel_id`."""
+    try:
+        _require_jwt(encrypted_key)
+    except jwt.exceptions.InvalidSignatureError as e:
+        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
+
+    if not techsupport_cron.is_available():
+        raise HTTPException(status_code=503, detail="Nightly techsupport pipeline is not installed in this image.")
+
+    try:
+        return await asyncio.to_thread(
+            techsupport_cron.checkpoint_channel_discovery,
+            payload.channel_id,
+            is_product_channel=payload.is_product_channel,
+            scan_timestamp=payload.scan_timestamp,
+            catchup_due=payload.catchup_due,
+            new_threads=payload.new_threads,
+            refreshed_threads=payload.refreshed_threads,
+        )
+    except Exception as exc:
+        utils.logger.error("Failed to checkpoint techsupport discovery for %s: %s", payload.channel_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to checkpoint channel discovery: {exc}") from exc
+
+
+@app.post("/process_techsupport_thread/", response_model=dict, response_class=JSONResponse)
+async def process_techsupport_thread_route(
+    payload: ProcessTechsupportThreadPayload,
+    encrypted_key: str,
+) -> dict:
+    """Classify and ingest one pre-formatted Slack thread and persist its state on disk."""
+    try:
+        _require_jwt(encrypted_key)
+    except jwt.exceptions.InvalidSignatureError as e:
+        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
+
+    if not techsupport_cron.is_available():
+        raise HTTPException(status_code=503, detail="Nightly techsupport pipeline is not installed in this image.")
+
+    try:
+        return await asyncio.to_thread(
+            techsupport_cron.process_thread_payload,
+            payload.channel_id,
+            payload.thread_ts,
+            payload.conversation_thread,
+            product=payload.product,
+        )
+    except Exception as exc:
+        utils.logger.error(
+            "Failed to process techsupport thread %s (channel=%s): %s",
+            payload.thread_ts,
+            payload.channel_id,
+            exc,
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail=f"Failed to process techsupport thread: {exc}") from exc
+
+
+@app.post("/finalize_techsupport_pipeline_run/", response_model=dict, response_class=JSONResponse)
+async def finalize_techsupport_pipeline_run_route(
+    payload: FinalizeTechsupportPipelinePayload,
+    encrypted_key: str,
+) -> dict:
+    """Run post-ingest GitHub push, review sync, contextual re-embed, and in-process retriever reload."""
+    try:
+        _require_jwt(encrypted_key)
+    except jwt.exceptions.InvalidSignatureError as e:
+        raise HTTPException(status_code=401, detail="Failed signature verification. Unauthorized.") from e
+
+    if not techsupport_cron.is_available():
+        raise HTTPException(status_code=503, detail="Nightly techsupport pipeline is not installed in this image.")
+
+    def _reload_in_process() -> None:
+        create_qa_pairs_lancedb_retrievers_and_indices(LANCEDB_FOLDERPATH)
+        utils.logger.info("Reloaded QA pairs retrievers/indices in-process after techsupport pipeline run")
+
+    try:
+        return await asyncio.to_thread(
+            techsupport_cron.finalize_run,
+            changed_this_run=payload.changed_this_run,
+            run_maintenance=payload.run_maintenance,
+            reload_retrievers=_reload_in_process,
+        )
+    except Exception as exc:
+        utils.logger.error("Failed to finalize techsupport pipeline run: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to finalize techsupport pipeline run: {exc}") from exc
 
 
 @app.post("/record_endorsement/", response_model=str, response_class=PlainTextResponse)
@@ -1813,7 +1874,7 @@ async def _run_update_golden_qa_pairs_task():
         raise
 
 @app.post("/update_golden_qa_pairs/", response_model=str, response_class=PlainTextResponse)
-async def update_golden_qa_pairs(product: str, encrypted_key: str, background_tasks: BackgroundTasks) -> str:
+async def update_golden_qa_pairs(encrypted_key: str, background_tasks: BackgroundTasks, product: Optional[str] = None) -> str:
     """
     Initiates the update of golden QA pairs in LanceDB for a specified product in the background.
 

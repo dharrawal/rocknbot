@@ -6,7 +6,7 @@ AWS_ACCOUNT ?= $(shell aws sts get-caller-identity --query 'Account' --output te
 AWS_REGION ?= us-west-2
 
 IMAGE=lil-lisa-server
-TAG=2.6.3
+TAG=2.6.4
 
 # lancedb
 LDB_TAG=2.6.0

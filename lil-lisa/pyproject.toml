@@ -1,6 +1,6 @@
 [project]
 name = "lil-lisa"
-version = "2.3.3"
+version = "2.3.4"
 requires-python = ">=3.10"
 dependencies = [
     "aiohttp==3.9.5",

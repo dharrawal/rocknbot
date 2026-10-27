@@ -84,7 +84,6 @@ from paths import (
     PACKAGE_ROOT,
     SYNC_STATE_PATH,
     ensure_import_paths,
-    read_lil_lisa_channel_ids,
 )
 
 ensure_import_paths()
@@ -93,7 +92,6 @@ PROJECT_ROOT = LILLISA_SERVER_ROOT
 
 from atomic_io import atomic_write_json  # noqa: E402
 
-ENV_PATH = SCRIPT_DIR / "env" / "techsupport_sync.env"
 STATE_PATH = SYNC_STATE_PATH
 
 # Bump only for a shape change; load_state() rejects any other version.
@@ -141,9 +139,7 @@ def _file_env() -> Dict[str, str]:
     by the callers) wins over both. Only CHANNEL_ID_* are taken from
     lil-lisa.env; the rest of that file stays with the Slack bot.
     """
-    env = read_lil_lisa_channel_ids()
-    env.update({k: v for k, v in dotenv_values(str(ENV_PATH)).items() if v is not None})
-    return env
+    return {}
 
 
 def load_env() -> Dict[str, str]:
@@ -156,7 +152,7 @@ def load_env() -> Dict[str, str]:
     required = ["SLACK_BOT_TOKEN", "TECHSUPPORT_CHANNEL_ID"]
     missing = [key for key in required if not env.get(key)]
     if missing:
-        raise RuntimeError(f"Missing required env var(s) {missing} - expected in {ENV_PATH}")
+        raise RuntimeError(f"Missing required env var(s) {missing}")
     return env
 
 

@@ -83,8 +83,6 @@ from paths import (
     LILLISA_SERVER_ENV_PATH,
     LILLISA_SERVER_ROOT,
     PACKAGE_ROOT,
-    bot_env_path,
-    read_lil_lisa_channel_ids,
 )
 
 from src.techsupport_state_paths import resolve_state_dir, resolve_verified_qa_dir
@@ -108,7 +106,6 @@ _FALSEY = frozenset({"false", "0", "no", "off"})
 
 # Same three files the loaders read; the names match the Secret keys devops
 # mounts with subPath.
-SYNC_ENV_PATH = PACKAGE_ROOT / "env" / "techsupport_sync.env"
 GITHUB_ENV_PATH = PACKAGE_ROOT / "env" / "github_push.env"
 
 PRODUCTS: Tuple[str, ...] = ("IDA", "IDDM", "IDO")
@@ -309,10 +306,8 @@ def _missing(severity: Severity, key: str, env_path: Path, why: str, extra_fix: 
 def run_preflight(
     *,
     environ: Optional[Mapping[str, str]] = None,
-    sync_env: Optional[Mapping[str, Optional[str]]] = None,
     github_env: Optional[Mapping[str, Optional[str]]] = None,
     lillisa_env: Optional[Mapping[str, Optional[str]]] = None,
-    sync_env_path: Optional[Path] = None,
     github_env_path: Optional[Path] = None,
     lillisa_env_path: Optional[Path] = None,
     server_root: Optional[Path] = None,
@@ -330,145 +325,29 @@ def run_preflight(
       server_root   -- LilLisa_Server root, for resolving relative paths.
     """
     environ = os.environ if environ is None else environ
-    sync_env_path = sync_env_path or SYNC_ENV_PATH
     github_env_path = github_env_path or GITHUB_ENV_PATH
     lillisa_env_path = lillisa_env_path or LILLISA_SERVER_ENV_PATH
     server_root = server_root or LILLISA_SERVER_ROOT
 
-    if sync_env is None:
-        # CHANNEL_ID_* live in lil-lisa.env. techsupport_sync.env and the
-        # process environment still override them when set.
-        sync_file = read_lil_lisa_channel_ids()
-        sync_file.update(_read_env_file(sync_env_path))
-    else:
-        sync_file = {k: v for k, v in sync_env.items() if v is not None}
-    sync = _overlay(sync_file, environ)
     github = _overlay(github_env if github_env is not None else _read_env_file(github_env_path), environ)
     lillisa = _overlay(lillisa_env if lillisa_env is not None else _read_env_file(lillisa_env_path), environ)
 
     problems: List[PreflightProblem] = []
-    problems.extend(_check_slack(sync, sync_env_path))
-    problems.extend(_check_product_scan(sync, lillisa, sync_env_path, lillisa_env_path))
     problems.extend(_check_server(lillisa, lillisa_env_path))
     problems.extend(_check_github(github, github_env_path))
     problems.extend(_check_writable_dirs(lillisa, lillisa_env_path, server_root))
 
-    sources: List[Path] = [sync_env_path, github_env_path, lillisa_env_path]
-    # Only when this call actually read lil-lisa.env. Injected sync_env (tests,
-    # and any caller that already resolved the config) does not consult it.
-    if sync_env is None and bot_env_path().is_file():
-        sources.append(bot_env_path())
+    sources: List[Path] = [github_env_path, lillisa_env_path]
     return PreflightResult(
         problems=tuple(problems),
         sources=tuple(sources),
     )
 
 
-def _check_slack(sync: Mapping[str, str], sync_env_path: Path) -> List[PreflightProblem]:
-    """The staging failure itself: without these two keys every sync() call
-    raises and the pipeline does nothing at all."""
-    problems: List[PreflightProblem] = []
-    for key in ("SLACK_BOT_TOKEN", "TECHSUPPORT_CHANNEL_ID"):
-        if not _clean(sync.get(key)):
-            problems.append(
-                _missing(
-                    Severity.BLOCKING,
-                    key,
-                    sync_env_path,
-                    " -- nightly_techsupport_sync.load_env() raises on every pipeline tick, so nothing is ingested",
-                )
-            )
-
-    return problems
-
-
-def _check_product_scan(
-    sync: Mapping[str, str],
-    lillisa: Mapping[str, str],
-    sync_env_path: Path,
-    lillisa_env_path: Path,
-) -> List[PreflightProblem]:
-    """The product-channel expert-correction pass runs by default. With it on,
-    a missing IDA/IDDM expert group makes the expert resolver raise
-    (expert_group rule 3), and a missing IDA/IDDM channel silently drops that
-    product's corrections -- either way the pass does not do its job. Only
-    required while the pass is enabled; IDO stays optional.
-
-    Both keys are DEGRADED, not BLOCKING, even though the pass cannot do its
-    job without them. The deciding question for this tier is not "is this
-    feature broken?" but "can the pipeline still ingest?", and here it can:
-    run_pipeline() runs the techsupport channel loop (sync -> classify ->
-    ingest) to completion FIRST, and only then calls
-    run_product_channel_pass() inside a try/except that counts the failure,
-    posts an admin alert, and returns -- so a missing expert group costs the
-    product-correction pass and nothing else. Specifically:
-      * EXPERT_GROUP_ID_* makes expert_group.ExpertResolver raise ValueError
-        for that product, which run_product_channel_pass() already catches per
-        product and reports as errored rather than quietly skipping.
-      * CHANNEL_ID_* is an explicitly supported per-product opt-out:
-        run_product_channel_pass()'s docstring states that "a product with no
-        channel id is not scanned", and product_channel_ids() simply leaves
-        it out of the dict. These are the Slack bot's channel variables
-        (lil-lisa.env), not a second copy in techsupport_sync.env.
-
-    Keeping these out of the BLOCKING tier matters for blast radius. The scan
-    defaults to ON (DEFAULT_SCAN_PRODUCT_CHANNELS = "true"), so treating them
-    as BLOCKING would make four extra keys mandatory for every deployment and
-    would refuse to boot a pod whose primary job -- ingesting the techsupport
-    channel -- is configured perfectly. BLOCKING stays scoped to "cannot
-    ingest at all, or would lose/corrupt data".
-    """
-    if not _scan_product_channels(lillisa):
-        return []
-    disable_hint = (
-        f"Or, to run without the product-channel pass, set TECHSUPPORT_SCAN_PRODUCT_CHANNELS=false in "
-        f"{lillisa_env_path} or the container environment."
-    )
-    problems: List[PreflightProblem] = []
-    for template, why, for_channel in (
-        (
-            "CHANNEL_ID_{product}",
-            " but TECHSUPPORT_SCAN_PRODUCT_CHANNELS is enabled, so that product's channel is not scanned "
-            "and its expert corrections are never picked up (every other product still scans)",
-            True,
-        ),
-        (
-            "EXPERT_GROUP_ID_{product}",
-            " but TECHSUPPORT_SCAN_PRODUCT_CHANNELS is enabled, so the expert resolver raises for that "
-            "product and its expert corrections are never picked up (techsupport channel ingest is "
-            "unaffected)",
-            False,
-        ),
-    ):
-        for product in REQUIRED_SCAN_PRODUCTS:
-            key = template.format(product=product)
-            if _clean(sync.get(key)):
-                continue
-            if for_channel:
-                problems.append(
-                    PreflightProblem(
-                        severity=Severity.DEGRADED,
-                        keys=(key,),
-                        problem=f"{key} is not set{why}.",
-                        remediation=(
-                            f"{key} is set in lil-lisa/app_envfiles/lil-lisa.env for the Slack bot. Inject that "
-                            f"same {key} into this container's environment (the API image does not contain "
-                            f"lil-lisa.env). Do not keep a second copy under another name. {disable_hint}"
-                        ),
-                    )
-                )
-            else:
-                problems.append(_missing(Severity.DEGRADED, key, sync_env_path, why, disable_hint))
-    return problems
-
-
 def _check_server(lillisa: Mapping[str, str], lillisa_env_path: Path) -> List[PreflightProblem]:
-    """Post-ingest index reload (nightly_pipeline.reload_techsupport_index):
-    without AUTHENTICATION_KEY it cannot authenticate, so rows written to
-    LanceDB stay invisible to live queries until a restart -- the pipeline
-    "works" but its output never reaches users, which is misbehaviour, hence
-    BLOCKING. LIL_LISA_SERVER_URL has a correct loopback default for the
-    in-process pipeline, so its absence is only DEGRADED."""
+    """Authentication key check: without AUTHENTICATION_KEY the pipeline endpoints
+    cannot authenticate requests from lil-lisa, so nothing can be ingested, hence
+    BLOCKING."""
     problems: List[PreflightProblem] = []
     if not _clean(lillisa.get("AUTHENTICATION_KEY")):
         problems.append(
@@ -476,24 +355,7 @@ def _check_server(lillisa: Mapping[str, str], lillisa_env_path: Path) -> List[Pr
                 Severity.BLOCKING,
                 "AUTHENTICATION_KEY",
                 lillisa_env_path,
-                " -- the post-ingest index reload cannot authenticate, so newly ingested entries stay "
-                "invisible to live queries",
-            )
-        )
-    if not _clean(lillisa.get("LIL_LISA_SERVER_URL")):
-        problems.append(
-            PreflightProblem(
-                severity=Severity.DEGRADED,
-                keys=("LIL_LISA_SERVER_URL",),
-                problem=(
-                    "LIL_LISA_SERVER_URL is not set; the index reload falls back to the loopback default "
-                    "http://127.0.0.1:8000 (correct for the in-process pipeline). A present-but-blank value "
-                    "falls back the same way (pr42-44j.9)."
-                ),
-                remediation=(
-                    f"Set LIL_LISA_SERVER_URL in {lillisa_env_path} or the container environment if the "
-                    "API is not reachable on the loopback default."
-                ),
+                " -- the techsupport pipeline endpoints cannot authenticate requests from lil-lisa",
             )
         )
     return problems
@@ -653,7 +515,7 @@ def format_preflight_report(result: PreflightResult, *, strict: bool, startup: b
     )
     lines.append(
         "Kubernetes: mount each Secret key at the exact path above using a volumeMount with subPath "
-        "(e.g. mountPath: <path above>, subPath: techsupport_sync.env), or inject the keys via env/envFrom. "
+        "(e.g. mountPath: <path above>, subPath: github_push.env), or inject the keys via env/envFrom. "
         "The image ships no cron/env/*.env files."
     )
     lines.append("")

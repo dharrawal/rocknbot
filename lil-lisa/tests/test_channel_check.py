@@ -63,9 +63,9 @@ class LogConfiguredChannelsTests(unittest.TestCase):
         )
         env = {
             "CHANNEL_ID_IDA": "C1",
-            "ADMIN_CHANNEL_ID_IDA": "C2",
+            "ADMIN_CHANNEL_ID": "C2",
             "CHANNEL_ID_IDDM": "C3",
-            "ADMIN_CHANNEL_ID_IDDM": "C4",
+            "TECHSUPPORT_CHANNEL_ID": "C4",
         }
 
         with patch.object(channel_check.logger, "warning") as warn:
@@ -73,9 +73,9 @@ class LogConfiguredChannelsTests(unittest.TestCase):
 
         self.assertEqual(warn.call_count, 4)
         self.assertIn("channel_not_found", result["CHANNEL_ID_IDA"])
-        self.assertIn("ARCHIVED", result["ADMIN_CHANNEL_ID_IDA"])
+        self.assertIn("ARCHIVED", result["ADMIN_CHANNEL_ID"])
         self.assertIn("bot is NOT a member", result["CHANNEL_ID_IDDM"])
-        self.assertIn("network down", result["ADMIN_CHANNEL_ID_IDDM"])
+        self.assertIn("network down", result["TECHSUPPORT_CHANNEL_ID"])
 
     def test_missing_scope_names_the_scopes(self):
         ok, text = channel_check.describe_channel({"ok": False, "error": "missing_scope"})

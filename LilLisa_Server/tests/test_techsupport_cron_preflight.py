@@ -317,14 +317,6 @@ class PreflightHealthPayloadTests(_ResetStateMixin, unittest.TestCase):
             lancedb_dir.mkdir()
             real_result = techsupport_preflight.run_preflight(
                 environ={},
-                sync_env={
-                    "SLACK_BOT_TOKEN": "xoxb-SECRET-DO-NOT-LOG",
-                    "TECHSUPPORT_CHANNEL_ID": "C1",
-                    "EXPERT_GROUP_ID_IDA": "S1",
-                    "EXPERT_GROUP_ID_IDDM": "S2",
-                    "CHANNEL_ID_IDA": "C_IDA",
-                    "CHANNEL_ID_IDDM": "C_IDDM",
-                },
                 github_env={
                     "GITHUB_TOKEN": "ghp_SECRETPAT",
                     # Deliberately malformed (embedded credentials) so this is the one
@@ -337,7 +329,6 @@ class PreflightHealthPayloadTests(_ResetStateMixin, unittest.TestCase):
                     "LIL_LISA_SERVER_URL": "http://127.0.0.1:8000",
                     "LANCEDB_FOLDERPATH": str(lancedb_dir),
                 },
-                sync_env_path=root / "cron" / "env" / "techsupport_sync.env",
                 github_env_path=root / "cron" / "env" / "github_push.env",
                 lillisa_env_path=root / "env" / "lillisa_server.env",
                 server_root=root,
