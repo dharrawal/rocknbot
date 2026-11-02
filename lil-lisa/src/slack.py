@@ -510,19 +510,64 @@ def addressee_decision(text: str, bot_user_id: str) -> Optional[bool]:
     return kind == "user" and value == bot_user_id
 
 
-def unaddressed_thread_is_for_bot(
-    participant_ids: Iterable[str], author_id: str, bot_user_ids: Iterable[str]
-) -> bool:
-    """An unaddressed post is for the bot when no other human has posted.
+def addressed_to_someone_else(text: str, bot_user_id: str) -> bool:
+    """True when the leftmost @ mention names somebody other than the bot.
 
-    The author and the bot are the only allowed posters. An empty participant
-    set (a brand-new thread, or a replies fetch that failed) is for the bot.
+    A user mention of anyone else, or a user-group mention, counts. Broadcasts
+    (@channel, @here, @everyone) do not: they are not a specific someone.
+    """
+    found = first_slack_addressee(text)
+    if found is None:
+        return False
+    kind, value = found
+    if kind == "user":
+        return value != bot_user_id
+    return kind == "other" and value not in {"channel", "here", "everyone"}
+
+
+def is_product_channel(channel_id: str) -> bool:
+    """True for the IDA, IDDM, and (when configured) IDO question channels."""
+    if channel_id in (CHANNEL_ID_IDDM, CHANNEL_ID_IDA):
+        return True
+    return bool(CHANNEL_ID_IDO) and channel_id == CHANNEL_ID_IDO
+
+
+def unaddressed_thread_is_for_bot(
+    participant_ids: Iterable[str], original_poster_id: str, bot_user_ids: Iterable[str]
+) -> bool:
+    """An unaddressed post is for the bot when only the original poster and the bot have posted.
+
+    Anyone else posting ends that. An empty participant set (a brand-new thread,
+    or a replies fetch that failed) is for the bot.
     """
     bots = set(bot_user_ids)
     for user_id in participant_ids:
-        if user_id != author_id and user_id not in bots:
+        if user_id != original_poster_id and user_id not in bots:
             return False
     return True
+
+
+def unaddressed_reply_decision(
+    participant_ids: Iterable[str],
+    original_poster_id: str,
+    bot_user_ids: Iterable[str],
+    *,
+    product_channel: bool,
+    root_text: str,
+    bot_user_id: str,
+) -> Tuple[bool, str]:
+    """Whether an unaddressed message in an existing thread is for the bot.
+
+    Stay silent once anyone but the original poster and the bot has posted.
+    In a product channel, also stay silent for the whole thread when the root
+    message @-addressed somebody else. Either way, a later message that
+    addresses the bot is decided before this function is called.
+    """
+    if not unaddressed_thread_is_for_bot(participant_ids, original_poster_id, bot_user_ids):
+        return False, "no addressee; another human has posted"
+    if product_channel and addressed_to_someone_else(root_text, bot_user_id):
+        return False, "product thread started addressed to someone else"
+    return True, "no addressee; no other human has posted"
 
 
 def _known_bot_user_ids() -> Set[str]:
@@ -539,8 +584,9 @@ async def handle_message_events(event, say):
     Handles Slack message events.
 
     Answers when the first Slack addressee is the bot. Stays silent when the first
-    addressee is anyone else. With no addressee, answers only when every other poster
-    in the thread is the bot (including a new thread where nobody else has posted).
+    addressee is anyone else. With no addressee, answers only while every poster
+    is the original poster or the bot. In a product channel, a thread whose root
+    message @-addresses somebody else stays silent until a message addresses the bot.
 
     Args:
         event (dict): The Slack message event object.
@@ -586,14 +632,20 @@ async def handle_message_events(event, say):
         logger.info(f"[DEBUG conversations_replies] channel_id={channel_id!r} conv_id={conv_id!r}")
         participants: Set[str] = set()
         bot_ids = _known_bot_user_ids()
+        root_text = ""
+        original_poster = author_id
         try:
             replies = await conversations_replies_with_retry(channel=channel_id, ts=conv_id)
-            for message in replies.data["messages"]:
+            messages = replies.data.get("messages") or []
+            if messages:
+                root_text = messages[0].get("text") or ""
+                original_poster = messages[0].get("user") or author_id
+            for message in messages:
                 user_id = message.get("user")
                 if not user_id:
                     continue
                 participants.add(user_id)
-                if user_id != author_id and user_id not in bot_ids:
+                if user_id != original_poster and user_id not in bot_ids:
                     break
         except Exception as exc:  # pylint: disable=broad-except
             logger.error(
@@ -601,8 +653,16 @@ async def handle_message_events(event, say):
                 f"channel={channel_id!r} conv_id={conv_id!r}: {exc}"
             )
             participants = set()
-        decision = unaddressed_thread_is_for_bot(participants, author_id, bot_ids)
-        reason = "no addressee; no other human has posted" if decision else "no addressee; another human has posted"
+            root_text = ""
+            original_poster = author_id
+        decision, reason = unaddressed_reply_decision(
+            participants,
+            original_poster,
+            bot_ids,
+            product_channel=is_product_channel(channel_id),
+            root_text=root_text,
+            bot_user_id=LIL_LISA_SLACK_USERID,
+        )
     else:
         reason = "first addressee is the bot" if decision else "first addressee is someone else"
 

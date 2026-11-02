@@ -1,5 +1,9 @@
 """Who a product-channel post is for: first Slack addressee, then who else has posted.
 
+A product-channel thread whose root @-addresses somebody else stays silent
+until a message addresses the bot. Any thread goes silent once someone other
+than the original poster and the bot has posted.
+
 Run from lil-lisa:
     PYTHONPATH=src python3 -m unittest tests.test_should_respond
 """
@@ -41,8 +45,19 @@ def addresses(text):
     return slack.addressee_decision(text, BOT)
 
 
-def unaddressed(participants, author=ALICE):
-    return slack.unaddressed_thread_is_for_bot(participants, author, {BOT})
+def unaddressed(participants, original_poster=ALICE):
+    return slack.unaddressed_thread_is_for_bot(participants, original_poster, {BOT})
+
+
+def reply_decision(participants, root_text, product_channel, original_poster=ALICE):
+    return slack.unaddressed_reply_decision(
+        participants,
+        original_poster,
+        {BOT},
+        product_channel=product_channel,
+        root_text=root_text,
+        bot_user_id=BOT,
+    )
 
 
 class AddresseeDecisionTests(unittest.TestCase):
@@ -90,6 +105,50 @@ class UnaddressedThreadTests(unittest.TestCase):
     def test_another_human_stays_silent(self):
         self.assertIs(unaddressed({ALICE, BOT, BOB}), False)
         self.assertIs(unaddressed({ALICE, BOB}), False)
+
+    def test_a_reply_from_someone_else_is_not_the_original_poster(self):
+        self.assertIs(unaddressed({BOB}, original_poster=ALICE), False)
+        self.assertIs(unaddressed({ALICE, BOT, BOB}, original_poster=ALICE), False)
+
+
+class AddressedThreadTests(unittest.TestCase):
+    def test_user_and_usergroup_mentions_name_someone_else(self):
+        self.assertIs(slack.addressed_to_someone_else(f"<@{ALICE}> how do I reset this?", BOT), True)
+        self.assertIs(slack.addressed_to_someone_else("<!subteam^S123|@experts> please look", BOT), True)
+
+    def test_the_bot_a_broadcast_and_no_mention_do_not(self):
+        self.assertIs(slack.addressed_to_someone_else(f"<@{BOT}> how do I reset this?", BOT), False)
+        self.assertIs(slack.addressed_to_someone_else(f"hey <@{BOT}|rocknbot> can you check", BOT), False)
+        self.assertIs(slack.addressed_to_someone_else("<!channel> standup notes", BOT), False)
+        self.assertIs(slack.addressed_to_someone_else("what version supports nested groups?", BOT), False)
+
+    def test_bot_first_keeps_the_thread(self):
+        self.assertIs(slack.addressed_to_someone_else(f"<@{BOT}> ask <@{ALICE}>", BOT), False)
+
+    def test_product_thread_started_for_someone_else_stays_silent(self):
+        answer, reason = reply_decision({ALICE, BOT}, f"<@{BOB}> how do I reset this?", True)
+        self.assertIs(answer, False)
+        self.assertEqual(reason, "product thread started addressed to someone else")
+
+    def test_same_root_outside_a_product_channel_still_answers(self):
+        answer, reason = reply_decision({ALICE}, f"<@{BOB}> how do I reset this?", False)
+        self.assertIs(answer, True)
+        self.assertEqual(reason, "no addressee; no other human has posted")
+
+    def test_product_thread_with_no_addressee_still_answers(self):
+        answer, _ = reply_decision({ALICE, BOT}, "what version supports nested groups?", True)
+        self.assertIs(answer, True)
+
+    def test_a_third_poster_stops_the_bot_in_any_channel(self):
+        for product_channel in (True, False):
+            answer, reason = reply_decision({ALICE, BOT, BOB}, "what version?", product_channel)
+            self.assertIs(answer, False)
+            self.assertEqual(reason, "no addressee; another human has posted")
+
+    def test_product_channels_are_the_question_channels_only(self):
+        self.assertIs(slack.is_product_channel("Cida"), True)
+        self.assertIs(slack.is_product_channel("Ciddm"), True)
+        self.assertIs(slack.is_product_channel("Cadmin"), False)
 
 
 if __name__ == "__main__":
